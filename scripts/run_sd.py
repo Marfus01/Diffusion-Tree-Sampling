@@ -21,7 +21,6 @@ from diffusers.utils import make_image_grid
 
 from src.core.sampling_sd.mcts_sd import MCTSStableDiffusionSampler
 from src.core.sampling_sd.fkd_sd import FKDStableDiffusion
-from src.core.sampling_sd.search_sd import GreedySearchStableDiffusion
 from src.core.rewards import get_reward_function, do_clip_score_diversity
 from src.core.config import get_default_sd_config, process_sd_config
 
@@ -71,13 +70,7 @@ def parse_script_args():
     mgroup.add_argument('--do_mcts', action='store_true', help='Enable MCTS (standard). Note: Excludes rollout version.')
     mgroup.add_argument('--do_mcts_rollout', action='store_true', help='Enable MCTS with Rollout.')
     mgroup.add_argument('--do_fkd', action='store_true', help='Enable FKD (standard). Note: Excludes rollout version.')
-    mgroup.add_argument('--do_fkd_rollout', action='store_true', help='Enable FKD with Rollout.')
-    mgroup.add_argument('--do_iss', action='store_true', help='Enable Importance Sampling.')
-    mgroup.add_argument('--do_greedy_svdd', action='store_true', help='Enable Greedy Search (SVDD schedule: search every step).')
-    mgroup.add_argument('--do_greedy_code', action='store_true', help='Enable Greedy Search (schedule from config parameters).')
-    mgroup.add_argument('--do_greedy_svdd_rollout', action='store_true', help='Enable Greedy Search (SVDD schedule) with Rollout.')
-    mgroup.add_argument('--do_greedy_code_rollout', action='store_true', help='Enable Greedy Search (config schedule) with Rollout.')
-    # mgroup.add_argument('--do_bon', action='store_true', help='Enable Best-of-N (rejection sampling).')
+    mgroup.add_argument('--do_bon', action='store_true', help='Enable Best-of-N (rejection sampling).')
 
     # --- Sampling Overrides ---
     sgroup = parser.add_argument_group('Sampling Overrides')
@@ -108,19 +101,8 @@ def parse_script_args():
     if args.do_mcts: config.mcts.enabled = True
     if args.do_mcts_rollout: config.mcts_rollout = True # Using a temporary attribute
     if args.do_fkd: config.fkd.enabled = True
-    if args.do_fkd_rollout: config.fkd_rollout = True # Using a temporary attribute
-    if args.do_iss: config.iss.enabled = True
-    if args.do_greedy_svdd: config.greedy_svdd_enabled = True
-    if args.do_greedy_code: config.greedy_code_enabled = True
-    if args.do_greedy_svdd_rollout: config.greedy_svdd_rollout_enabled = True
-    if args.do_greedy_code_rollout: config.greedy_code_rollout_enabled = True
-    # if args.do_bon: config.bon.enabled = True
+    if args.do_bon: config.bon.enabled = True
 
-    # # Check if at least one method is enabled
-    # if not config.mcts.enabled and not hasattr(config, 'mcts_rollout') and \
-    #    not config.fkd.enabled and not hasattr(config, 'fkd_rollout') and \
-    #    not config.iss.enabled and not config.greedy.enabled and not hasattr(config, 'greedy_rollout'):
-    #     raise ValueError("At least one method (MCTS, MCTS-R, FKD, FKD-R, ISS, GREEDY, GREEDY-R) must be enabled.")
 
     if args.compute_budget is not None:
         config.sampling.compute_budget = args.compute_budget
@@ -128,7 +110,6 @@ def parse_script_args():
     if args.potential_type is not None: config.fkd.potential_type = args.potential_type
     if args.lambda_param is not None:
         config.fkd.lambda_param = args.lambda_param
-        config.iss.lambda_param = args.lambda_param
     if args.guiding_reward_fns is not None: config.guiding_reward_fns = args.guiding_reward_fns
 
     if 'AestheticScore' in config.guiding_reward_fns:
@@ -332,8 +313,8 @@ def run_bon(config, prompt, base_pipeline):
         logger.error("Base pipeline is None, cannot run Best-of-N.")
         return metrics_data, all_base_samples_pil, all_base_samples_pt
 
-    # Use candidate counts from ISS config for N values
-    n_candidate_list = sorted(config.iss.candidates)
+    # Use candidate counts from FKD config for N values
+    n_candidate_list = sorted(config.fkd.particles)
     max_n_candidates = max(n_candidate_list)
     # Use a reasonable batch size for generation
     gen_batch_size = config.eval.eval_batch_size # Reuse eval batch size
@@ -378,7 +359,7 @@ def run_bon(config, prompt, base_pipeline):
         current_samples_pil = base_pipeline.image_processor.postprocess(
                 current_samples_pt, output_type="pil", do_denormalize=[True] * n_candidates # Diffusers standard is denormalize
         )
-        # Store for potential reuse by ISS
+        # Store for potential reuse
         all_base_samples_pil[n_candidates] = current_samples_pil
         all_base_samples_pt[n_candidates] = current_samples_pt
 
@@ -554,224 +535,6 @@ def run_fkd(config, prompt, reward_name, pipeline):
 
     return metrics_data
 
-
-@torch.no_grad()
-def run_iss(config, prompt, reward_name, pipeline):
-    """Run Importance Sampling (ISS) using base model."""
-    metrics_data = {}
-    # Setup memory logging
-    method_name = "ISS"
-    log_file_prefix = Path(config.paths.metrics_dir) / f"gpu_memory_{method_name}.txt"
-    log_file_prefix.parent.mkdir(parents=True, exist_ok=True)
-
-    reward_fn_iss = lambda images_pil: get_reward_function(
-        reward_name=reward_name,
-        images=images_pil,
-        prompts=[prompt] * len(images_pil),
-    )
-
-    # Create output directory for ISS images
-    output_dir_iss_images = Path(config.paths.image_dir) / reward_name / "iss"
-    output_dir_iss_images.mkdir(parents=True, exist_ok=True)
-
-    # Determine max candidate count and generate base samples once
-    nfe_per_particle = config.sampling.num_inference_steps
-    eval_particles =  [nfe // nfe_per_particle for nfe in config.sampling.compute_budget]
-    max_n_particles = max(eval_particles)
-    logger.info(f"Running ISS base generation for max N = {max_n_particles}")
-
-    # Process in batches to handle large candidate counts
-    all_base_samples = []
-
-    # Timing the base generation phase
-    start_time = time.time()
-
-    for batch_start in tqdm.tqdm(range(0, max_n_particles, config.iss.batch_size), 
-                          desc="Generating base samples",
-                          disable=not config.common.use_progress_bar):
-        batch_size = min(config.iss.batch_size, max_n_particles - batch_start)
-        # logger.info(f"Processing generation batch {batch_start//config.iss.batch_size + 1}/{(max_n_particles + config.iss.batch_size - 1)//config.iss.batch_size} " +
-        #       f"(candidates {batch_start+1}-{batch_start+batch_size}/{max_n_particles})")
-
-        # Run generation with base pipeline
-        output = pipeline(
-            prompt=[prompt] * batch_size,
-            negative_prompt=[config.dataset.negative_prompt] * batch_size,
-            num_inference_steps=config.sampling.num_inference_steps,
-            guidance_scale=config.sampling.guidance_scale,
-            eta=config.sampling.eta,
-            output_type="pil",
-        ).images
-
-        all_base_samples.extend(output)
-
-    # Log sampling time for ISS
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    elapsed = time.time() - start_time
-    with open(log_file_prefix, 'a') as f:
-        f.write(f"{method_name} sampling time: {elapsed:.4f}s\n")
-
-    # Evaluate for each target NFE level by resampling from corresponding subset
-    for i, n_particles in enumerate(eval_particles):
-        # Reset memory stats for this particle count
-        if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats()
-        logger.info(f"Evaluating ISS for N = {n_particles} particles")
-
-        # Select the first n_particles base samples
-        current_base_samples = all_base_samples[:min(n_particles, max_n_particles)]
-        
-        num_to_resample = min(config.sampling.population_size, len(current_base_samples))
-        # Get indices of top num_to_resample samples based on rewards
-        rewards = np.array(reward_fn_iss(current_base_samples))
-        top_indices = np.argsort(rewards)[-num_to_resample:]
-        eval_images = [current_base_samples[i] for i in top_indices]
-
-        # Log memory usage after this particle count
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-            curr = torch.cuda.memory_allocated()
-            peak = torch.cuda.max_memory_allocated()
-            with open(log_file_prefix, 'a') as f:
-                f.write(f"{method_name} Particles {n_particles}: current {curr/1024**2:.2f}MB, peak {peak/1024**2:.2f}MB\n")
-
-        # Evaluate metrics on the resampled images
-        metrics = evaluate_images(eval_images, prompt, config)
-        metrics['NFEs'] = config.sampling.compute_budget[i]
-        metrics_data[config.sampling.compute_budget[i]] = metrics
-
-        # Save image grid
-        grid_path = output_dir_iss_images / f"{prompt.replace(' ', '_')}_{config.sampling.compute_budget[i]}.png"
-        rows = int(math.ceil(np.sqrt(len(eval_images))))
-        cols = int(math.ceil(len(eval_images) / rows))
-        image_grid = make_image_grid(eval_images, rows=rows, cols=cols)
-        image_grid.save(grid_path)
-
-    if not config.common.use_progress_bar:
-        dlogging.set_verbosity_warning()
-
-    return metrics_data
-
-
-@torch.no_grad()
-def run_greedy(config, prompt, reward_name, pipeline):
-    """Run Greedy Search guided Stable Diffusion generation."""
-    logger.info(f"--- Running Greedy Search for prompt: '{prompt}' with reward: '{reward_name}' ---")
-    metrics_data = {}
-
-    # Create output directory for Greedy images
-    dir_prefix = config.greedy.variant_name_for_path
-    if config.greedy.use_rollout:
-        dir_prefix += "-r"
-    # Setup memory logging
-    method_name = dir_prefix
-    log_file_prefix = Path(config.paths.metrics_dir) / f"gpu_memory_{method_name}.txt"
-    log_file_prefix.parent.mkdir(parents=True, exist_ok=True)
-    output_dir_greedy_images = Path(config.paths.image_dir) / reward_name / dir_prefix
-    output_dir_greedy_images.mkdir(parents=True, exist_ok=True)
-
-    reward_fn_greedy = lambda images_pil: get_reward_function(
-        reward_name=reward_name,
-        images=images_pil,
-        prompts=[prompt] * len(images_pil),
-    )
-
-    # Calculate NFE per image generated by the greedy method
-    nfe_per_particle = config.sampling.num_inference_steps
-    if config.greedy.use_rollout:
-        num_s_steps = 0
-        if config.greedy.search_frequency > 0 and config.greedy.search_t_end >= config.greedy.search_t_start:
-            num_s_steps = (config.greedy.search_t_end - config.greedy.search_t_start) // config.greedy.search_frequency + 1
-        
-        if num_s_steps > 0:
-            total_rollout_unet_calls = 0
-            for s_idx_offset in range(num_s_steps):
-                current_main_step_idx = config.greedy.search_t_start + s_idx_offset * config.greedy.search_frequency
-                if current_main_step_idx > config.sampling.num_inference_steps -2: # Rollout must have at least 1 step
-                    continue
-                rollout_len = config.sampling.num_inference_steps - (current_main_step_idx + 1)
-                if rollout_len > 0:
-                    total_rollout_unet_calls += config.greedy.num_candidates_per_particle * rollout_len
-            nfe_per_particle += total_rollout_unet_calls
-
-    particles_per_image = sorted(list(set([max(1, nfe // (config.sampling.population_size * nfe_per_particle)) for nfe in config.sampling.compute_budget])))
-
-    logger.info(f"Calculated particles per image: {particles_per_image}.")
-
-    search_args = {
-        'use_search': True, # Implicitly true as we are in run_greedy
-        'search_t_start': config.greedy.search_t_start,
-        'search_t_end': config.greedy.search_t_end,
-        'search_frequency': config.greedy.search_frequency,
-        'guidance_reward_fn': reward_name, # Passed to run_greedy
-        'use_rollout': config.greedy.use_rollout,
-    }
-
-    for i, target_nfe_budget in enumerate(config.sampling.compute_budget):
-        # Reset memory stats for this NFE iteration
-        if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats()
-        all_sampled_images_pil = []
-
-        # Timing the sampling phase
-        start_time = time.time()
-
-        for batch_start in tqdm.tqdm(range(0, config.sampling.population_size, config.greedy.batch_size),
-                                    desc="Generating Greedy samples",
-                                    disable=not config.common.use_progress_bar):
-            current_gen_batch_size = min(config.greedy.batch_size, config.sampling.population_size - batch_start)
-            if current_gen_batch_size <= 0: continue
-            search_args["num_candidates_per_particle"] = particles_per_image[i]
-            # logger.info(f"Generating batch of {current_gen_batch_size} images for Greedy Search.")
-            output = pipeline(
-                prompt=[prompt], # Pipeline expects a list of prompts
-                negative_prompt=[config.dataset.negative_prompt],
-                search_args=search_args,
-                num_images_per_prompt=current_gen_batch_size,
-                num_inference_steps=config.sampling.num_inference_steps,
-                guidance_scale=config.sampling.guidance_scale,
-                eta=config.sampling.eta,
-                output_type="pil",
-            ).images
-            all_sampled_images_pil.extend(output)
-
-        # Log sampling time for Greedy search
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        elapsed = time.time() - start_time
-        with open(log_file_prefix, 'a') as f:
-            f.write(f"{method_name} NFE {target_nfe_budget}: sampling time {elapsed:.4f}s\n")
-
-        logger.info(f"Evaluating Greedy Search for NFE budget {target_nfe_budget} images)")
-
-        eval_images = all_sampled_images_pil
-            
-        metrics = evaluate_images(eval_images, prompt, config)
-        metrics['NFEs'] = target_nfe_budget # Report against the target budget
-        metrics_data[target_nfe_budget] = metrics
-
-        grid_path = output_dir_greedy_images / f"{prompt.replace(' ', '_')[:50]}_{target_nfe_budget}.png"
-        if eval_images:
-            rows = int(math.ceil(np.sqrt(len(eval_images))))
-            cols = int(math.ceil(len(eval_images) / rows))
-            try:
-                image_grid = make_image_grid(eval_images, rows=rows, cols=cols)
-                image_grid.save(grid_path)
-            except Exception as e:
-                logger.error(f"Failed to save image grid for greedy search: {e}")
-        # else: logger.debug(f"No images to save for grid at NFE {target_nfe_budget}")
-        # Log memory usage after this NFE iteration
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-            curr = torch.cuda.memory_allocated()
-            peak = torch.cuda.max_memory_allocated()
-            with open(log_file_prefix, 'a') as f:
-                f.write(f"{method_name} NFE {target_nfe_budget}: current {curr/1024**2:.2f}MB, peak {peak/1024**2:.2f}MB\n")
-
-    return metrics_data
-
-
 def aggregate_and_save_summary_sd(all_run_metrics_dfs, reward_name, output_dir):
     """
     Aggregates metrics from multiple DataFrames (one per method/prompt/N run) and saves summary CSVs.
@@ -814,8 +577,6 @@ def aggregate_and_save_summary_sd(all_run_metrics_dfs, reward_name, output_dir):
 def load_pipeline(config, method):
     if method == 'FKD' or method == 'FKD-R':
         pipeline = FKDStableDiffusion.from_pretrained(config.model.sd_model_id)
-    elif method.startswith("GREEDY"):
-        pipeline = GreedySearchStableDiffusion.from_pretrained(config.model.sd_model_id)
     else:
         pipeline = StableDiffusionPipeline.from_pretrained(config.model.sd_model_id)
     
@@ -892,12 +653,7 @@ def worker_process(gpu_id, config, prompt_subset):
     if hasattr(config, 'mcts_rollout') and config.mcts_rollout: enabled_methods.append("MCTS-R")
     if config.fkd.enabled: enabled_methods.append("FKD")
     if hasattr(config, 'fkd_rollout') and config.fkd_rollout: enabled_methods.append("FKD-R")
-    if config.iss.enabled: enabled_methods.append("ISS")
-    if hasattr(config, 'greedy_svdd_enabled') and config.greedy_svdd_enabled: enabled_methods.append("GREEDY_SVDD")
-    if hasattr(config, 'greedy_code_enabled') and config.greedy_code_enabled: enabled_methods.append("GREEDY_CODE")
-    if hasattr(config, 'greedy_svdd_rollout_enabled') and config.greedy_svdd_rollout_enabled: enabled_methods.append("GREEDY_SVDD-R")
-    if hasattr(config, 'greedy_code_rollout_enabled') and config.greedy_code_rollout_enabled: enabled_methods.append("GREEDY_CODE-R")
-    # if config.bon.enabled: enabled_methods.append("BoN") # If BoN is re-enabled
+    if config.bon.enabled: enabled_methods.append("BoN")
 
     for method in enabled_methods:
         # Reset GPU memory stats before running each method
@@ -910,8 +666,6 @@ def worker_process(gpu_id, config, prompt_subset):
         # Set rollout flags based on method name
         current_config.mcts.use_rollout = False
         current_config.fkd.use_rollout = False
-        current_config.greedy.use_rollout = False
-        current_config.greedy.enabled = False # Reset greedy enabled flag
 
         if method == "MCTS":
             pass
@@ -923,31 +677,6 @@ def worker_process(gpu_id, config, prompt_subset):
         elif method == "FKD-R":
             current_config.fkd.use_rollout = True
             current_config.fkd.enabled = True
-        elif method == "ISS":
-            pass
-        elif method == "GREEDY_SVDD":
-            current_config.greedy.enabled = True
-            current_config.greedy.search_t_start = 0
-            current_config.greedy.search_t_end = current_config.sampling.num_inference_steps - 1
-            current_config.greedy.search_frequency = 1
-            current_config.greedy.variant_name_for_path = "greedy_svdd"
-        elif method == "GREEDY_CODE":
-            current_config.greedy.enabled = True
-            # Defaults from config for search params are used
-            current_config.greedy.variant_name_for_path = "greedy_code"
-        elif method == "GREEDY_SVDD-R":
-            current_config.greedy.enabled = True
-            current_config.greedy.use_rollout = True
-            current_config.greedy.search_t_start = 0
-            current_config.greedy.search_t_end = current_config.sampling.num_inference_steps - 1
-            current_config.greedy.search_frequency = 1
-            current_config.greedy.variant_name_for_path = "greedy_svdd"
-        elif method == "GREEDY_CODE-R":
-            current_config.greedy.enabled = True
-            current_config.greedy.use_rollout = True
-            # Defaults from config for search params are used
-            current_config.greedy.variant_name_for_path = "greedy_code"
-
         pipeline = None
         try:
             pipeline = load_pipeline(current_config, method)
@@ -961,10 +690,8 @@ def worker_process(gpu_id, config, prompt_subset):
             run_fn = run_mcts
         elif method == "FKD" or method == "FKD-R":
             run_fn = run_fkd
-        elif method == "ISS":
-            run_fn = run_iss
-        elif method.startswith("GREEDY"): # Catch all GREEDY variants
-            run_fn = run_greedy
+        elif method == 'BoN':
+            run_fn = run_bon
         else:
             logger.warning(f"[GPU {gpu_id}] Unknown method {method}, skipping.")
             continue

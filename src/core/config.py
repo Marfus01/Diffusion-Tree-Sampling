@@ -310,6 +310,7 @@ class SDFKDConfig(BaseFKDConfig):
     reward_min_val: float = 0.0 # Updated in processing
     batch_size: int = 20 # FKD internal batch size
 
+
 @dataclass
 class SDGreedySearchConfig:
     enabled: bool = False
