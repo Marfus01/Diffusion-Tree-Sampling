@@ -16,6 +16,15 @@ logger = logging.getLogger(__name__)
 def default_path(subpath: str) -> str:
     return str(Path.home() / subpath)
 
+def env_or_default_path(env_var: str, subpath: str) -> str:
+    """Path from `env_var` if set, otherwise `~/<subpath>`."""
+    return os.environ.get(env_var) or default_path(subpath)
+
+def cache_path(subdir: str) -> str:
+    """Directory for downloaded reward / feature models (CLIP, ImageReward, aesthetic head).
+    Root is $DTS_CACHE_DIR, defaulting to ~/scratch/.cache."""
+    return str(Path(env_or_default_path("DTS_CACHE_DIR", "scratch/.cache")).expanduser() / subdir)
+
 def seed_experiment(seed):
     """Set the seed for reproducibility in PyTorch runs.
 
@@ -66,12 +75,12 @@ class PathsConfig:
 class CommonConfig:
     """Common arguments for experiment setup, paths, logging."""
     # base_dir: str = default_path("scratch/mcts/tamia_exp") # Top-level directory (e.g., ./experiments)
-    base_dir: str = default_path("mcts/experiments")
+    base_dir: str = field(default_factory=lambda: env_or_default_path("DTS_BASE_DIR", "mcts/experiments"))
     exp_name: Optional[str] = None # If None, derived from dataset/task
     seed: Optional[int] = 42
     device: str = "cuda"
     push_to_wandb: bool = False
-    hf_home: Optional[str] = default_path("scratch/.cache/huggingface")
+    hf_home: Optional[str] = field(default_factory=lambda: env_or_default_path("HF_HOME", "scratch/.cache/huggingface"))
     use_progress_bar: bool = True
 
 # --- Base classes for method configs --- 
@@ -183,7 +192,7 @@ DATASETS_INFO = {
 @dataclass
 class ImageDatasetConfig:
     name: str = "mnist"
-    data_path: str = default_path("scratch/.cache/deeplake/data")
+    data_path: str = field(default_factory=lambda: env_or_default_path("DTS_DATA_DIR", "scratch/.cache/deeplake/data"))
     splits: List[str] = field(default_factory=lambda: ['train', 'test'])
     image_size: int = 32
     channels: int = 1

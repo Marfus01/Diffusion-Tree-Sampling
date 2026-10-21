@@ -1,5 +1,8 @@
 import torch
-import torch_tensorrt
+try:
+    import torch_tensorrt  # noqa: F401  (registers the torch.compile backend)
+except ImportError:
+    torch_tensorrt = None
 import numpy as np
 import math
 import tqdm

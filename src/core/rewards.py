@@ -2,10 +2,24 @@ import io
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch_tensorrt
 import numpy as np
-import clip
-import hpsv2
+
+from src.core.config import cache_path
+
+# Optional dependencies: only the SD rewards need them, and torch_tensorrt is only
+# importable on machines with an NVIDIA driver.
+try:
+    import torch_tensorrt  # registers the "torch_tensorrt" / "tensorrt" torch.compile backends
+except ImportError:
+    torch_tensorrt = None
+try:
+    import clip
+except ImportError:
+    clip = None
+try:
+    import hpsv2
+except ImportError:
+    hpsv2 = None
 
 
 # --- Classifier Reward Functions ---
@@ -77,7 +91,7 @@ def do_human_preference_score(*, images, prompts, use_paths=False):
 def do_clip_score_diversity(*, images, prompts):
     global REWARDS_DICT
     if REWARDS_DICT["Clip-Score"] is None:
-        REWARDS_DICT["Clip-Score"] = CLIPScore(download_root=".", device="cuda")
+        REWARDS_DICT["Clip-Score"] = CLIPScore(download_root=cache_path("clip"), device="cuda")
     with torch.no_grad():
         arr_clip_result = []
         arr_img_features = []
@@ -149,7 +163,7 @@ def do_image_reward(*, images, prompts):
 def do_clip_score(*, images, prompts):
     global REWARDS_DICT
     if REWARDS_DICT["Clip-Score"] is None:
-        REWARDS_DICT["Clip-Score"] = CLIPScore(download_root="~/scratch/.cache/clip", device="cuda")
+        REWARDS_DICT["Clip-Score"] = CLIPScore(download_root=cache_path("clip"), device="cuda")
     with torch.no_grad():
         clip_result = [
             REWARDS_DICT["Clip-Score"].score(prompt, images[i])
@@ -166,7 +180,7 @@ def do_aesthetic_score(*, images, prompts=None):
     with torch.no_grad():
         # Get CLIP image features first
         if REWARDS_DICT["Clip-Score"] is None:
-            REWARDS_DICT["Clip-Score"] = CLIPScore(download_root="~/scratch/.cache/clip", device="cuda")
+            REWARDS_DICT["Clip-Score"] = CLIPScore(download_root=cache_path("clip"), device="cuda")
         
         scores = []
         for image in images:
@@ -250,7 +264,10 @@ import os
 import torch
 
 from PIL import Image
-import ImageReward as RM
+try:
+    import ImageReward as RM
+except ImportError:
+    RM = None
 
 
 '''
@@ -268,7 +285,10 @@ import os
 import torch
 import torch.nn as nn
 from PIL import Image
-from ImageReward.models.BLIP.blip_pretrain import BLIP_Pretrain
+try:
+    from ImageReward.models.BLIP.blip_pretrain import BLIP_Pretrain
+except ImportError:
+    BLIP_Pretrain = None
 from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize
 
 from torchvision.transforms.functional import pil_to_tensor
@@ -532,7 +552,7 @@ def rm_load(
     if name in RM.utils._MODELS:
         model_path = RM.ImageReward_download(
             RM.utils._MODELS[name],
-            download_root or os.path.expanduser("~/scratch/.cache/ImageReward"),
+            download_root or cache_path("ImageReward"),
         )
     elif os.path.isfile(name):
         model_path = name
@@ -547,21 +567,22 @@ def rm_load(
     if med_config is None:
         med_config = RM.ImageReward_download(
             "https://huggingface.co/THUDM/ImageReward/blob/main/med_config.json",
-            download_root or os.path.expanduser("~/.cache/ImageReward"),
+            download_root or cache_path("ImageReward"),
         )
 
     model = IRSMC(device=device, med_config=med_config).to(device)
     msg = model.load_state_dict(state_dict, strict=False)
 
-    model = torch.compile(
-        model,
-        backend="torch_tensorrt",
-        options={
-            "truncate_long_and_double": True,
-            "enabled_precisions": {torch.float32, torch.float16},
-        },
-        dynamic=False,
-    )
+    if torch_tensorrt is not None and os.environ.get("DTS_NO_COMPILE", "0") != "1":
+        model = torch.compile(
+            model,
+            backend="torch_tensorrt",
+            options={
+                "truncate_long_and_double": True,
+                "enabled_precisions": {torch.float32, torch.float16},
+            },
+            dynamic=False,
+        )
     
     print("ImageReward checkpoint loaded")
     model.eval()
@@ -580,8 +601,7 @@ from urllib.request import urlretrieve  # pylint: disable=import-outside-topleve
 
 def get_aesthetic_model(clip_model="vit_l_14"):
     """load the aethetic model"""
-    home = expanduser("~")
-    cache_folder = home + "/scratch/.cache/emb_reader"
+    cache_folder = cache_path("emb_reader")
     path_to_model = cache_folder + "/sa_0_4_"+clip_model+"_linear.pth"
     if not os.path.exists(path_to_model):
         os.makedirs(cache_folder, exist_ok=True)

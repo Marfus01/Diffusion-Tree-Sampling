@@ -1,5 +1,4 @@
 import logging
-import deeplake
 import torch
 from torchvision import transforms
 import sklearn.datasets as skld
@@ -26,6 +25,7 @@ def get_img_dataset(
     filter_labels=None,
 ):
     """Loads/downloads dataset and returns dataloaders."""
+    import deeplake
     data = {}
 
     # Use attributes from config

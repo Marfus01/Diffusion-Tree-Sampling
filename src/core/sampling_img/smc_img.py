@@ -21,7 +21,6 @@ from diffusers.utils import deprecate
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 warnings.filterwarnings("ignore", message=".*convert_buffers_to_embedding.*") # Ignore specific warnings if needed
-os.environ["HF_HOME"] = "/home/mila/j/jain.vineet/scratch/.cache/huggingface" # Set cache if needed
 
 
 def retrieve_timesteps(
