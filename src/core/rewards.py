@@ -10,7 +10,7 @@ from src.core.config import cache_path
 # importable on machines with an NVIDIA driver.
 try:
     import torch_tensorrt  # registers the "torch_tensorrt" / "tensorrt" torch.compile backends
-except ImportError:
+except (ImportError, RuntimeError):  # RuntimeError without an NVIDIA driver
     torch_tensorrt = None
 try:
     import clip

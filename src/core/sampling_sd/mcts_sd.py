@@ -1,7 +1,7 @@
 import torch
 try:
     import torch_tensorrt  # noqa: F401  (registers the torch.compile backend)
-except ImportError:
+except (ImportError, RuntimeError):  # RuntimeError without an NVIDIA driver
     torch_tensorrt = None
 import numpy as np
 import math
