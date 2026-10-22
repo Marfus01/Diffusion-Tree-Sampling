@@ -103,6 +103,8 @@ def compute_ground_truth_values(samples, t, diffusion_model, reward_fn, num_traj
     
     Args:
         samples: List of samples (MCTS nodes or SMC particles) all at the same timestep
+        t: model time index of the samples' state; t < 0 means the samples are already clean.
+           Rollouts apply p_sample at t, t-1, ..., 0, ending at the clean sample.
         diffusion_model: The diffusion model to sample trajectories
         reward_fn: Function to compute rewards at t=0
         num_trajectories: Number of trajectories to sample per sample
@@ -113,8 +115,7 @@ def compute_ground_truth_values(samples, t, diffusion_model, reward_fn, num_traj
     """
     ground_truth_values = {}
 
-    # Skip if already at t=0
-    if t <= 0:
+    if t < 0:
         x_batch = torch.stack([sample.x_t[0] if hasattr(sample, 'x_t') else sample['samples'] for sample in samples])
         all_rewards = np.exp(reward_fn(x_batch))
         # Store rewards in ground truth values dictionary
@@ -130,7 +131,7 @@ def compute_ground_truth_values(samples, t, diffusion_model, reward_fn, num_traj
     
     # Run the diffusion model until t=0
     current_t = t
-    while current_t > 0:
+    while current_t >= 0:
         t_tensor = torch.tensor([current_t] * x_batch.size(0), device=device).long()
         with torch.no_grad():
             x_batch, _ = diffusion_model.p_sample(x_batch, t_tensor)
@@ -168,16 +169,18 @@ def compute_relative_errors(samples, ground_truth_values):
     for sample in samples:
         sample_id = id(sample)
         if sample_id in ground_truth_values:
-            value_estimate = sample.value_est if hasattr(sample, 'value_est') else sample['rewards']
+            # MCTS nodes store log values; SMC particles store e^{r(x0_hat)}
+            if hasattr(sample, 'value_est'):
+                log_estimate = sample.value_est
+            else:
+                log_estimate = np.log(sample['rewards'] + 1e-10)
             ground_truth = ground_truth_values[sample_id]
             
             # Skip if ground truth is zero to avoid division by zero
             if abs(ground_truth) < 1e-10:
                 continue
             
-            # Compute relative error
-            # rel_error = 200 * abs(value_estimate - ground_truth) / (abs(value_estimate) + abs(ground_truth))
-            rel_error = (np.log(value_estimate+1e-10) - np.log(ground_truth+1e-10)) / np.log(ground_truth+1e-10)
+            rel_error = (log_estimate - np.log(ground_truth+1e-10)) / np.log(ground_truth+1e-10)
             # rel_error = (np.log(value_estimate+1e-10) - np.log(ground_truth+1e-10))
             # rel_rmse = np.sqrt(np.mean(rel_error ** 2))
             relative_errors.append(rel_error)
@@ -213,7 +216,9 @@ def evaluate_mcts_value_estimates(nodes_by_timestep, diffusion_model, reward_fn,
             continue
             
         # Compute ground truth values
-        ground_truth_values = compute_ground_truth_values(nodes, t, diffusion_model, reward_fn, 
+        # node.t is the model index of its state; terminal nodes (t = 0) hold the clean sample
+        state_index = t if t > 0 else -1
+        ground_truth_values = compute_ground_truth_values(nodes, state_index, diffusion_model, reward_fn, 
                                                         num_trajectories, device)
         # Compute relative errors
         errors = compute_relative_errors(nodes, ground_truth_values)
@@ -250,7 +255,8 @@ def evaluate_smc_value_estimates(smc_particles, diffusion_model, reward_fn, time
             continue
             
         # Compute ground truth values
-        ground_truth_values = compute_ground_truth_values(particles, t, diffusion_model, reward_fn, 
+        # SMC history keys are t+1 for the state at model index t; key 0 is the clean sample
+        ground_truth_values = compute_ground_truth_values(particles, t - 1, diffusion_model, reward_fn, 
                                                         num_trajectories, device)
         
         # Compute relative errors

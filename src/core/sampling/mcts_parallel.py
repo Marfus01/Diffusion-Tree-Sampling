@@ -103,7 +103,9 @@ class MCTSDiffusionSampler:
                  batch_size: int = 4,
                  output_dir: str = None,
                  visualization_timesteps: list = None,
-                 dims: int = 2): # Added dims for 2D data shape
+                 dims: int = None,
+                 pw_alpha: float = None,
+                 pw_alpha_root: float = None):
         """
         Args:
           diffusion_model: Pretrained diffusion model providing:
@@ -123,7 +125,16 @@ class MCTSDiffusionSampler:
           batch_size: Number of nodes to process in parallel per iteration.
           output_dir: Directory to save visualizations and results.
           visualization_timesteps: Timesteps to include in visualization.
-          dims: Dimensionality of the data.
+          dims: Dimensionality of the data (defaults to diffusion_model.input_dim).
+          pw_alpha: Progressive-widening exponent for expansion nodes and the meta-root. None keeps
+            the original hard-coded values (0.3 for nodes and 0.4 for the meta-root with rollouts,
+            0.4 for both without).
+          pw_alpha_root: Exponent for the meta-root only; overrides pw_alpha there.
+
+        Node values are stored in log space: value_est = log M_hat, the soft backup is
+        log-mean-exp over children, and selection samples children with probability
+        softmax(value_est). Terminal nodes (t = 0) hold the clean sample after the last,
+        deterministic denoising step at index 0.
         """
         self.model = diffusion_model
         self.reward_fn = reward_fn
@@ -144,9 +155,11 @@ class MCTSDiffusionSampler:
         self.cache_noise_pred = cache_noise_pred
         self.exploration_type = exploration_type
         self.batch_size = batch_size
-        self.dims = dims
+        self.dims = dims if dims is not None else diffusion_model.input_dim
+        self.pw_alpha = pw_alpha
+        self.pw_alpha_root = pw_alpha_root
         self.output_dir = output_dir
-        self.visualization_timesteps = visualization_timesteps
+        self.visualization_timesteps = visualization_timesteps if visualization_timesteps is not None else []
 
         # Setup diffusion related variables
         self.setup_diffusion()
@@ -185,10 +198,7 @@ class MCTSDiffusionSampler:
         """
         Generate initial noise matching the data dimensionality.
         """
-        data_shape = (batch_size, self.dims)
-        # Ensure noise is generated with the correct dtype, matching model parameters
-        dtype = next(self.model.noise_predictor.parameters()).dtype
-        return torch.randn(data_shape, device=self.device, dtype=dtype)
+        return self.model.sample_initial_noise(batch_size).to(self.device)
 
     def p_sample(self, x_t, t, predict_x0=False, eta=None):
         """
@@ -265,6 +275,20 @@ class MCTSDiffusionSampler:
         """
         return self.p_sample(x_t, t, predict_x0=True)
 
+    def _finalize_terminal(self, node):
+        """Applies the last denoising step (index 0, zero variance) to a node that reached t = 0,
+        so the terminal node holds the same clean sample the SMC samplers return. Costs 1 NFE."""
+        if getattr(node, 'is_final', False):
+            return
+        x_clean, _ = self.p_sample(node.x_t, 0)
+        node.x_t = x_clean
+        node.is_final = True
+
+    def _terminal_value(self, node):
+        """Finalizes a new terminal node and sets its log value r(x_0)."""
+        self._finalize_terminal(node)
+        node.update_value(float(np.asarray(self.reward_fn(node.x_t)).reshape(-1)[0]))
+
     def _ddim_rollout_value(self, x_t, t):
         """
         Evaluate intermediate nodes by deterministically rolling out x_t to predicted x_0
@@ -277,7 +301,7 @@ class MCTSDiffusionSampler:
         """
         with torch.no_grad():
             x_0_approx, noise_pred = self.ddim_denoise(x_t, t)
-            r_values = np.exp(self.reward_fn(x_0_approx))
+            r_values = self.reward_fn(x_0_approx)
 
         return r_values, noise_pred
 
@@ -298,23 +322,20 @@ class MCTSDiffusionSampler:
             if use_exploration and random.random() < self.current_exploration_prob:
                 return random.choice(node.children)
                 
-            # Otherwise, select based on value (exploitation)
-            values = torch.tensor(np.array([max(1e-6, child.value_est) for child in node.children]))
-            
-            # Sample a child proportional to value using torch operations
+            # Otherwise sample a child with probability proportional to exp(log value)
+            values = torch.tensor([child.value_est for child in node.children], dtype=torch.float64)
             if self.maximize:
                 idx = torch.argmax(values).item()
             else:
-                probs = values / values.sum()
+                probs = torch.softmax(values, dim=0)
                 idx = torch.multinomial(probs, 1).item()
             return node.children[idx]
         
         elif self.exploration_type == 'ucb':
             # UCB exploration
             if not use_exploration:
-                # If exploration is disabled, just use values
-                values = torch.tensor(np.array([max(1e-6, child.value_est) for child in node.children]))
-                probs = values / values.sum()
+                values = torch.tensor([child.value_est for child in node.children], dtype=torch.float64)
+                probs = torch.softmax(values, dim=0)
                 idx = torch.multinomial(probs, 1).item()
                 return node.children[idx]
             
@@ -323,7 +344,7 @@ class MCTSDiffusionSampler:
             
             # Vectorized UCB calculation
             child_visits = torch.tensor(np.array([max(1, child.visit_count) for child in node.children]))
-            child_values = torch.tensor(np.array([child.value_est for child in node.children]))
+            child_values = torch.exp(torch.tensor([child.value_est for child in node.children], dtype=torch.float64))
             
             # UCB formula: value + c * sqrt(ln(parent_visits) / child_visits)
             exploration_term = self.c_ucb * torch.sqrt(torch.log(torch.tensor(parent_visits)) / child_visits)
@@ -348,16 +369,13 @@ class MCTSDiffusionSampler:
         # Special case for meta-root
         if self._is_meta_root(node):
             effective_visits = max(1, node.visit_count)
-            if self.use_rollout:
-                alpha_min = 0.4
-                alpha_max = 0.4
-                self.progressive_width_const = 2
-                meta_root_alpha = alpha_min + (alpha_max - alpha_min) * (self.nfes / self.num_nfes)
+            self.progressive_width_const = 2
+            if self.pw_alpha_root is not None:
+                meta_root_alpha = self.pw_alpha_root
+            elif self.pw_alpha is not None:
+                meta_root_alpha = self.pw_alpha
             else:
-                alpha_min = 0.4
-                alpha_max = 0.4
-                self.progressive_width_const = 2
-                meta_root_alpha = alpha_min + (alpha_max - alpha_min) * (self.nfes / self.num_nfes)
+                meta_root_alpha = 0.4
             max_children = math.floor(self.progressive_width_const * (effective_visits ** meta_root_alpha))
             return len(node.children) < max_children
         
@@ -372,16 +390,11 @@ class MCTSDiffusionSampler:
         effective_visits = max(1, node.visit_count)
         
         # Progressive widening: max_children = C * N(node)^alpha
-        if self.use_rollout:
-            alpha_min = 0.3
-            alpha_max = 0.3
-            self.progressive_width_const = 2
-            progressive_width_alpha = alpha_min + (alpha_max - alpha_min) * ((self.num_timesteps - node.t) / self.num_timesteps)
+        self.progressive_width_const = 2
+        if self.pw_alpha is not None:
+            progressive_width_alpha = self.pw_alpha
         else:
-            alpha_min = 0.4
-            alpha_max = 0.4
-            self.progressive_width_const = 2
-            progressive_width_alpha = alpha_min + (alpha_max - alpha_min) * (self.nfes / self.num_nfes)
+            progressive_width_alpha = 0.3 if self.use_rollout else 0.4
         max_children = math.floor(self.progressive_width_const * (effective_visits ** progressive_width_alpha))
         
         # Ensure at least 1 child is allowed
@@ -392,19 +405,17 @@ class MCTSDiffusionSampler:
     def _backup(self, node):
         """
         Update the value of a node and all its ancestors.
-        For non-leaf nodes, value is the average of its children's values
+        For non-leaf nodes, the log value is the log-mean-exp of the children's log values,
+        i.e. M_hat(parent) is the average of the children's M_hat.
         """
         # Traverse up the tree
         current = node
         while current.parent is not None:
             parent = current.parent
             
-            # Calculate the average value of all children
             if parent.children:
-                child_values = torch.tensor(np.array([child.value_est for child in parent.children]))
-                avg_value = child_values.mean().item()
-                
-                # Update the parent's value
+                child_values = torch.tensor([child.value_est for child in parent.children], dtype=torch.float64)
+                avg_value = (torch.logsumexp(child_values, dim=0) - math.log(len(parent.children))).item()
                 parent.update_value(avg_value)
 
             # Move up the tree
@@ -502,7 +513,7 @@ class MCTSDiffusionSampler:
                     #     x_tm1_batch = self.p_sample(x_t_batch, t)
                     #     val_batch = self._ddim_rollout_value(x_tm1_batch, t - 1)
                     x_tm1_batch, x_0_batch = self.expand_nodes(batch_nodes, t, predict_x0=True)
-                    val_batch = np.exp(self.reward_fn(x_0_batch))
+                    val_batch = self.reward_fn(x_0_batch)
 
                     for i, node in enumerate(batch_nodes):
                         x_tm1 = x_tm1_batch[i:i+1]
@@ -547,16 +558,14 @@ class MCTSDiffusionSampler:
                         # If we've reached t=0, evaluate reward and do backup
                         if next_node.t <= 0:
                             # Pass x_t (final image) directly to reward function
-                            r_value = np.exp(self.reward_fn(next_node.x_t))
-                            next_node.update_value(r_value)
+                            self._terminal_value(next_node)
                             self._backup(next_node)
 
             # 4. Process terminal nodes (if any nodes reached t=0)
             for node in terminal_nodes:
                 if node.visit_count == 1:  # Only evaluate if first visit
                     # Pass x_t (final image) directly to reward function
-                    r_value = np.exp(self.reward_fn(node.x_t))
-                    node.update_value(r_value)
+                    self._terminal_value(node)
                     self._backup(node)
                     nodes_to_remove.add(id(node))
 
@@ -586,8 +595,7 @@ class MCTSDiffusionSampler:
             if node.t <= 0: # Ensure it is indeed terminal
                 # Assume reward calculation and backup should happen if it's a fresh terminal state.
                 # This function is called after creating a child, so this child is new.
-                r_value = np.exp(self.reward_fn(node.x_t))
-                node.update_value(r_value)
+                self._terminal_value(node)
                 self._backup(node)
             else: # Should not happen based on above separation
                 del finalized_sim_paths[path_idx]
@@ -604,8 +612,7 @@ class MCTSDiffusionSampler:
                 if t <= 0: # Should have been caught or already terminal
                     for path_idx, node in sim_path_node_list:
                         if path_idx not in finalized_sim_paths: # If not already processed
-                            r_value = np.exp(self.reward_fn(node.x_t))
-                            node.update_value(r_value)
+                            self._terminal_value(node)
                             self._backup(node)
                             finalized_sim_paths[path_idx] = node
                     continue
@@ -628,8 +635,7 @@ class MCTSDiffusionSampler:
                         parent_node_in_rollout.noise_pred = noise_pred_batch[i:i+1]
 
                     if next_node_in_rollout.t <= 0:
-                        r_value = np.exp(self.reward_fn(next_node_in_rollout.x_t))
-                        next_node_in_rollout.update_value(r_value)
+                        self._terminal_value(next_node_in_rollout)
                         self._backup(next_node_in_rollout)
                         finalized_sim_paths[path_idx] = next_node_in_rollout
                     else:
@@ -767,8 +773,7 @@ class MCTSDiffusionSampler:
                         parent_leaf_node.noise_pred = noise_pred_batch[i:i+1]
 
                     if one_step_child.t <= 0: # Reached terminal by this single step
-                        r_value = np.exp(self.reward_fn(one_step_child.x_t))
-                        one_step_child.update_value(r_value)
+                        self._terminal_value(one_step_child)
                         self._backup(one_step_child)
                         # next_path_nodes_update already has this terminal node for path_idx
 
@@ -1146,8 +1151,7 @@ class MCTSDiffusionSampler:
         if isinstance(final_samples_reward, (np.ndarray, torch.Tensor)) and final_samples_reward.shape[0] == len(sampled_nodes):
              for i, node in enumerate(sampled_nodes):
                  try:
-                     # Use np.exp() consistent with how rewards might be stored/used elsewhere
-                     node.update_value(np.exp(final_samples_reward[i]))
+                     node.update_value(float(final_samples_reward[i]))
                  except (IndexError, TypeError, ValueError) as e:
                      print(f"Warning: Reward array processing error: {e}. Rewards shape: {getattr(final_samples_reward, 'shape', 'N/A')}, index: {i}")
                      pass # Handle error appropriately
