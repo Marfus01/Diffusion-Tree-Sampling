@@ -7,7 +7,7 @@
 #SBATCH -e logs/%x_%j.err
 # A-R003: SD-v1.5 + ImageReward, one prompt, 10^3 NFE: Best-of-N, FK, DTS, DTS*, then offline metrics.
 set -euo pipefail
-source jobs/stageA/env.sh
+source $HOME/run/dts/Diffusion-Tree-Sampling/jobs/stageA/env.sh
 
 PROMPT="a photo of a black teddy bear"
 COMMON="--prompts \"$PROMPT\" --sd_model_id stable-diffusion-v1-5/stable-diffusion-v1-5 --guiding_reward_fns ImageReward \

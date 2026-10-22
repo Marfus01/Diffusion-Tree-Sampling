@@ -8,7 +8,7 @@
 # A-R001 unit checks, A-R002 2D gaussian_mixture check (code defaults, 1 seed),
 # and a GMM d_x=80 throughput probe for the M1 budget.
 set -euo pipefail
-source jobs/stageA/env.sh
+source $HOME/run/dts/Diffusion-Tree-Sampling/jobs/stageA/env.sh
 
 echo "[$(date)] A-R001 unit checks"
 python -m pytest -q tests/
