@@ -176,13 +176,15 @@ class SMCDiffusion2DSampler:
             )
             if weights is not None:
                 weights.add_log_ratio(log_prob_diffusion - log_prob_proposal)
+                weights.invalidate(~torch.isfinite(particles).all(dim=-1))
 
         log_weights = torch.zeros(num_particles, device=self.device)
         if weights is not None:
             final_reward = self.reward_fn(particles).detach()
             weights.final_step(final_reward)
             log_weights = weights.log_w
-            logger.info(f"Final ESS ratio {weights.ess_ratio():.3f}; resampling events {weights.num_resampling_events}")
+            logger.info(f"Final ESS ratio {weights.ess_ratio():.3f}; resampling events {weights.num_resampling_events}; "
+                        f"invalid particles {weights.num_invalid}")
         if return_all_particles:
             final = {'samples': particles.clone()}
             if weights is not None:

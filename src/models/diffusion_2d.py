@@ -294,7 +294,7 @@ class DiffusionModel:
 
             if guidance_grad is not None:
                 guidance_grad = guidance_grad.to(self.device)
-                x_t_prev = x_t_prev + posterior_variance_t * guidance_scale * guidance_grad
+                x_t_prev = x_t_prev + std_dev_t ** 2 * guidance_scale * guidance_grad
 
             if return_log_prob:
                 var = torch.broadcast_to(std_dev_t ** 2, x_t_prev.shape)
@@ -304,7 +304,7 @@ class DiffusionModel:
                 log_prob_diffusion = -0.5 * (x_t_prev - pred_prev_sample_mean).pow(2) / safe_var + log_norm
                 log_prob_diffusion = torch.where(stochastic, log_prob_diffusion, torch.zeros_like(log_prob_diffusion)).sum(dim=-1)
                 if guidance_grad is not None:
-                    shift = posterior_variance_t * guidance_scale * guidance_grad
+                    shift = std_dev_t ** 2 * guidance_scale * guidance_grad
                     log_prob_proposal = -0.5 * (x_t_prev - pred_prev_sample_mean - shift).pow(2) / safe_var + log_norm
                     log_prob_proposal = torch.where(stochastic, log_prob_proposal, torch.zeros_like(log_prob_proposal)).sum(dim=-1)
                 else:

@@ -3,8 +3,8 @@
 For each samples_<method>_<class>_N<nfe>.npz in --run_dir/metrics:
   FID2048   Inception-v3 pool features (pytorch-fid), real set = the class's test images
             without augmentation;
-  CMMD      MMD with a Gaussian kernel (sigma = 10, x1000) on L2-normalized CLIP ViT-L/14 image
-            embeddings (Jayasumana et al. 2024), same real set;
+  CMMD      MMD with a Gaussian kernel (sigma = 10, x1000) on L2-normalized CLIP ViT-L/14-336px
+            image embeddings (Jayasumana et al. 2024 reference setting), same real set;
   HeldOutAcc fraction classified as the target class by ahsanjavid/convnext-tiny-finetuned-cifar10;
   CLIPDiversity mean sqrt(2 (1 - cos)) over random pairs of generated CLIP embeddings;
   Distinct  number of distinct images.
@@ -83,7 +83,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--run_dir', required=True)
     parser.add_argument('--data_path', required=True, help='torchvision CIFAR-10 root')
-    parser.add_argument('--clip_model', default='openai/clip-vit-large-patch14')
+    parser.add_argument('--clip_model', default='openai/clip-vit-large-patch14-336')
     parser.add_argument('--heldout_model', default='ahsanjavid/convnext-tiny-finetuned-cifar10')
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--out', default=None)

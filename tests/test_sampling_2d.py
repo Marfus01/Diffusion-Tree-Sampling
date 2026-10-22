@@ -1,11 +1,12 @@
 """SMC weights, NFE accounting and asymptotic exactness on the analytic GMM (CPU)."""
 import math
+import random
 
 import numpy as np
 import pytest
 import torch
 
-from src.core.smc_weights import SMCWeights, gaussian_step_log_ratio
+from src.core.smc_weights import SMCWeights, SMCDivergedError, gaussian_step_log_ratio
 from src.core.sampling.smc_2d import SMCDiffusion2DSampler
 from src.core.sampling.mcts_parallel import MCTSDiffusionSampler
 from src.models.gmm_analytic import GMMInverseProblem, AnalyticGMMDiffusion, sliced_wasserstein
@@ -112,6 +113,7 @@ def test_dts_nfe_matches_cache_rule(gmm2):
     each terminal node one final denoising step; nothing else is charged."""
     problem, model = gmm2
     torch.manual_seed(0)
+    random.seed(0)   # epsilon-greedy exploration uses Python's random
     s = MCTSDiffusionSampler(model, reward_fn=lambda x: problem.log_likelihood(x).numpy(),
                              expand_timesteps=[100, 80, 60, 40, 20], num_nfes=20_000, device='cpu',
                              use_progress_bar=False, use_rollout=True, batch_size=1)
@@ -128,6 +130,7 @@ def test_dts_nfe_matches_cache_rule(gmm2):
 def test_dts_approaches_target(gmm2):
     problem, model = gmm2
     torch.manual_seed(0)
+    random.seed(0)   # epsilon-greedy exploration uses Python's random
     s = MCTSDiffusionSampler(model, reward_fn=lambda x: problem.log_likelihood(x).numpy(),
                              expand_timesteps=[100, 80, 60, 40, 20], num_nfes=200_000, device='cpu',
                              use_progress_bar=False, use_rollout=True, batch_size=1)
@@ -141,3 +144,14 @@ def test_dts_approaches_target(gmm2):
     floor = sliced_wasserstein(problem.sample_target(2000, seed=2), target, n_projections=2000)
     assert sws[1] < sws[0], sws
     assert sws[1] < 3 * floor + 0.2, (sws, floor)
+
+
+def test_diverging_guidance_is_reported_not_masked():
+    """d_x=80 instance 0: TDS with guidance_scale 1 diverges for every particle and must raise
+    instead of returning NaN samples with finite weights; guidance_scale 0.5 stays finite."""
+    problem = GMMInverseProblem(dim=80, instance_seed=0)
+    model = AnalyticGMMDiffusion(problem, device='cpu')
+    with pytest.raises(SMCDivergedError):
+        run_smc(model, problem, 256, use_smc=True, use_guidance=True, adaptive=True, guidance_scale=1.0)
+    out, _ = run_smc(model, problem, 256, use_smc=True, use_guidance=True, adaptive=True, guidance_scale=0.5)
+    assert torch.isfinite(out['log_weights']).all() and torch.isfinite(out['samples']).all()

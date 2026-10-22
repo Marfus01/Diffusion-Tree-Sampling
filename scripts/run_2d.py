@@ -19,6 +19,7 @@ from src.core.sampling.mcts_parallel import MCTSDiffusionSampler
 from src.core.sampling.smc_2d import SMCDiffusion2DSampler
 from src.evaluation.distribution_metrics import compute_mmd
 from src.evaluation.value_metrics import evaluate_mcts_value_estimates, evaluate_smc_value_estimates
+from src.core.smc_weights import SMCDivergedError
 from src.utils.run_logging import (
     RewardCounter, write_run_meta, reset_peak_memory, peak_memory_mb, distinct_count,
 )
@@ -82,9 +83,8 @@ def parse_script_args():
 
     sgroup = parser.add_argument_group('Sampling Overrides')
     sgroup.add_argument('--compute_budget', nargs='+', type=int, help='Compute budget in NFEs.')
-    sgroup.add_argument('--population_size', type=int, help='Number of evaluation samples per NFE point.')
+    sgroup.add_argument('--population_size', type=int, help='Number of evaluation samples per NFE point (default 1000; 2000 for gmm).')
     sgroup.add_argument('--potential_type', type=str, help='Potential type for FKD/SMC.')
-    sgroup.add_argument('--lambda_param', type=float, help='FK weight temperature (multiplies the reward in SMC weights only).')
     sgroup.add_argument('--lambda', dest='reward_lambda', type=float, default=1.0,
                         help='Inverse temperature of the target p e^{lambda r}: every method uses lambda * r.')
     sgroup.add_argument('--guidance_scale', type=float, default=1.0, help='Scale for reward-based guidance.')
@@ -112,6 +112,7 @@ def build_config(args, seed):
     if args.dataset == 'gmm':
         config.dataset.name = f"gmm_d{args.gmm_dim}_i{args.gmm_instance}"
         config.eval.evaluate_value = False
+        config.sampling.population_size = 2000
     else:
         if args.dataset not in config.dataset.supported_datasets:
             raise ValueError(f"Unknown dataset {args.dataset}; supported: {config.dataset.supported_datasets} or 'gmm'")
@@ -125,7 +126,6 @@ def build_config(args, seed):
     if args.compute_budget is not None: config.sampling.compute_budget = sorted(args.compute_budget)
     if args.population_size is not None: config.sampling.population_size = args.population_size
     if args.potential_type is not None: config.fkd.potential_type = args.potential_type
-    if args.lambda_param is not None: config.fkd.lambda_param = args.lambda_param
     if args.adaptive_resampling is not None: config.fkd.adaptive_resampling = args.adaptive_resampling
     if args.mcts_batch_size is not None: config.mcts.batch_size = args.mcts_batch_size
     if args.no_value_eval: config.eval.evaluate_value = False
@@ -233,18 +233,19 @@ def run_mcts(config, args, dataset_name, diffusion_model, task, problem, reward,
         pw_alpha_root=args.pw_alpha_root,
     )
     mcts_sampler.initialize_root_nodes()
-    reward.reset()
     reset_peak_memory()
-    build_time = 0.0
+    build_time, build_reward_evals = 0.0, 0
 
     for target_nfes in config.sampling.compute_budget:
+        reward.reset()
         t0 = time.time()
         mcts_sampler.build_search_tree(num_nfes=target_nfes)
         build_time += time.time() - t0
-        build_reward_evals = reward.n_evals
+        build_reward_evals += reward.n_evals
         t1 = time.time()
         samples, _, nodes_by_timestep = mcts_sampler.sample_from_tree(population_size=config.sampling.population_size)
         sample_time = time.time() - t1
+        peak_mem = peak_memory_mb()
         samples_np = samples.cpu().numpy()
         rewards_np = task.calculate_reward_diff(samples).detach().cpu().numpy()
 
@@ -253,7 +254,7 @@ def run_mcts(config, args, dataset_name, diffusion_model, task, problem, reward,
             'MeanReward': rewards_np.mean(), 'GT_MeanReward': task.gt_rewards.mean(),
             'ESS': dup_ess(samples_np, config.sampling.population_size), 'Distinct': distinct_count(samples_np),
             'BuildTime': build_time, 'SampleTime': sample_time, 'Time': build_time + sample_time,
-            'RewardEvals': build_reward_evals, 'PeakMemMB': peak_memory_mb(),
+            'RewardEvals': build_reward_evals, 'PeakMemMB': peak_mem,
         }
         m.update(distribution_metrics(samples_np, task, problem, args.sw_projections))
         metrics_data[target_nfes] = m
@@ -323,9 +324,18 @@ def run_fkd(config, args, dataset_name, diffusion_model, task, problem, reward, 
         reward.reset()
         reset_peak_memory()
         t0 = time.time()
-        out = sampler.sample(num_particles=n_particles, eta=config.sampling.eta, return_all_particles=return_all)
+        try:
+            out = sampler.sample(num_particles=n_particles, eta=config.sampling.eta, return_all_particles=return_all)
+            if use_smc and not torch.isfinite(out['log_weights']).any():
+                raise SMCDivergedError("SMC population has no particle with a finite weight (diverged).")
+        except SMCDivergedError as e:
+            logger.error(f"  {method_name} NFE {nfe_target} ({n_particles} particles): {e}")
+            metrics_data[nfe_target] = {'NFEs': nfe_target, 'ActualParticles': n_particles, 'Diverged': 1,
+                                        'Time': time.time() - t0}
+            continue
         run_time = time.time() - t0
         run_reward_evals = reward.n_evals
+        peak_mem = peak_memory_mb()
         particles = out['samples']
 
         if use_smc:
@@ -344,7 +354,9 @@ def run_fkd(config, args, dataset_name, diffusion_model, task, problem, reward, 
             'MeanReward': rewards_np.mean(), 'GT_MeanReward': task.gt_rewards.mean(),
             'ESS': dup_ess(samples_np, n_eval), 'Distinct': distinct_count(samples_np),
             'FinalWeightESS': float(1.0 / (w.pow(2).sum() * n_particles)),
-            'Time': run_time, 'RewardEvals': run_reward_evals, 'PeakMemMB': peak_memory_mb(),
+            'InvalidParticles': int((~torch.isfinite(out['log_weights'])).sum()) if use_smc
+                                else int((~torch.isfinite(particles).all(dim=-1)).sum()),
+            'Time': run_time, 'RewardEvals': run_reward_evals, 'PeakMemMB': peak_mem,
         }
         m.update(distribution_metrics(samples_np, task, problem, args.sw_projections))
         metrics_data[nfe_target] = m

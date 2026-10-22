@@ -172,7 +172,8 @@ class MCTSStableDiffusionSampler:
                  width: int = 512,
                  output_dir: str = None,
                  visualization_timesteps: List[int] = None,
-                 pw_alpha_root: Optional[float] = None):
+                 pw_alpha_root: Optional[float] = None,
+                 negative_prompt: str = ""):
         """
         Args:
           reward_fn: Function that takes decoded images and returns scalar rewards
@@ -224,6 +225,7 @@ class MCTSStableDiffusionSampler:
         # These will be set up in setup_diffusion
         self.prompt_embeds = None
         self.negative_prompt_embeds = None
+        self.negative_prompt = negative_prompt
         self.extra_step_kwargs = {}
         
         # Load Stable Diffusion pipeline components
@@ -309,7 +311,7 @@ class MCTSStableDiffusionSampler:
             device=self.device,
             num_images_per_prompt=1,
             do_classifier_free_guidance=self.do_classifier_free_guidance,
-            negative_prompt="",  # Empty string as negative prompt
+            negative_prompt=self.negative_prompt,
         )
         
         # Store prompt embeddings for later use
@@ -1447,6 +1449,8 @@ class MCTSStableDiffusionSampler:
         #     best_node = max(sampled_nodes, key=lambda x: x.value_est)
         #     sampled_nodes = [best_node]
 
+        for node in sampled_nodes:
+            self._finalize_terminal(node)
         final_latents = torch.cat([node.x_t for node in sampled_nodes], dim=0)
         final_images = self.decode_latents(final_latents, output_type="pil")
         final_images_reward = self.reward_fn(final_images)

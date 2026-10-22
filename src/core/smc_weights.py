@@ -14,10 +14,18 @@ lambda * r(x_0) + sum_s log(p/q), i.e. the target is p_theta,0(x_0) e^{lambda r(
 The log-weight is reset to zero only when the population is resampled. A potential step
 that skips resampling (adaptive mode with ESS above the threshold) keeps the accumulated
 weight, and the final weights are returned so that evaluation samples are drawn by weight.
+
+A particle whose state, reward or log-ratio becomes non-finite (diverging gradient guidance)
+gets log-weight -inf: it is never selected again and is counted in `num_invalid`. Drawing
+from a population with no valid particle raises.
 """
 from typing import Iterable, Optional
 
 import torch
+
+
+class SMCDivergedError(RuntimeError):
+    """No particle of the population has a finite importance weight."""
 
 
 class SMCWeights:
@@ -41,12 +49,30 @@ class SMCWeights:
         self.prev_reward = torch.full((num_particles,), float(reward_min_value), device=device)
         self.num_resampling_events = 0
 
+    def _drop_nonfinite(self, *values):
+        bad = ~torch.isfinite(self.log_w)
+        for v in values:
+            bad = bad | ~torch.isfinite(v)
+        self.log_w = torch.where(bad, torch.full_like(self.log_w, -float('inf')), self.log_w)
+
+    @property
+    def num_invalid(self) -> int:
+        return int((~torch.isfinite(self.log_w)).sum())
+
+    def invalidate(self, mask: torch.Tensor) -> None:
+        """Gives log-weight -inf to particles where mask [K] is True (e.g. non-finite states)."""
+        self.log_w = torch.where(mask.to(self.log_w.device), torch.full_like(self.log_w, -float('inf')), self.log_w)
+
     def add_log_ratio(self, log_ratio: torch.Tensor) -> None:
         """Adds log p_theta(x_{s-1}|x_s) - log q(x_{s-1}|x_s) of one denoising step, shape [K]."""
-        self.log_w = self.log_w + torch.nan_to_num(log_ratio.to(self.log_w), nan=0.0)
+        log_ratio = log_ratio.to(self.log_w)
+        self.log_w = self.log_w + torch.where(torch.isfinite(log_ratio), log_ratio, torch.zeros_like(log_ratio))
+        self._drop_nonfinite(log_ratio)
 
     def ess_ratio(self) -> float:
-        w = torch.softmax(self.log_w, dim=0)
+        if not torch.isfinite(self.log_w).any():
+            return 0.0
+        w = torch.softmax(self.log_w.double(), dim=0)
         return float(1.0 / (w.pow(2).sum() * self.num_particles))
 
     def potential_step(self, sampling_idx: int, reward: torch.Tensor) -> Optional[torch.Tensor]:
@@ -55,7 +81,9 @@ class SMCWeights:
         Returns the ancestor indices [K] when the population is resampled, otherwise None.
         """
         reward = reward.to(self.log_w)
-        self.log_w = self.log_w + self.lmbda * (reward - self.prev_reward)
+        incr = self.lmbda * (reward - self.prev_reward)
+        self.log_w = self.log_w + torch.where(torch.isfinite(incr), incr, torch.zeros_like(incr))
+        self._drop_nonfinite(incr)
         self.prev_reward = reward
         if self.adaptive_resampling:
             do_resample = self.ess_ratio() < self.ess_threshold
@@ -72,15 +100,16 @@ class SMCWeights:
     def final_step(self, reward: torch.Tensor) -> None:
         """Applies the terminal potential lambda * (r(x_0) - r~_{last}); no resampling."""
         reward = reward.to(self.log_w)
-        self.log_w = self.log_w + self.lmbda * (reward - self.prev_reward)
+        incr = self.lmbda * (reward - self.prev_reward)
+        self.log_w = self.log_w + torch.where(torch.isfinite(incr), incr, torch.zeros_like(incr))
+        self._drop_nonfinite(incr)
         self.prev_reward = reward
 
     def draw(self, n: int) -> torch.Tensor:
         """Multinomial draw of n indices with replacement, proportional to exp(log_w)."""
-        log_w = torch.nan_to_num(self.log_w, nan=-float('inf'))
-        if not torch.isfinite(log_w).any():
-            log_w = torch.zeros_like(log_w)
-        probs = torch.softmax(log_w, dim=0)
+        if not torch.isfinite(self.log_w).any():
+            raise SMCDivergedError("SMC population has no particle with a finite weight (diverged).")
+        probs = torch.softmax(self.log_w.double(), dim=0)
         return torch.multinomial(probs, n, replacement=True)
 
 

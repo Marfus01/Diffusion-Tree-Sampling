@@ -23,7 +23,7 @@ from diffusers.utils import make_image_grid
 from src.core.sampling_sd.mcts_sd import MCTSStableDiffusionSampler
 from src.core.sampling_sd.fkd_sd import FKDStableDiffusion
 from src.core.rewards import get_reward_function, do_clip_score_diversity
-from src.core.config import get_default_sd_config, process_sd_config
+from src.core.config import get_default_sd_config, process_sd_config, seed_experiment
 from src.utils.run_logging import RewardCounter, write_run_meta, reset_peak_memory, peak_memory_mb
 
 # Setup logging
@@ -81,7 +81,8 @@ def parse_script_args():
     sgroup.add_argument('--compute_budget', nargs='+', type=int, help='Override compute budget in NFEs.')
     sgroup.add_argument('--population_size', type=int, help='Number of final # samples per prompt.')
     sgroup.add_argument('--potential_type', type=str, help='Override potential type for FKD.')
-    sgroup.add_argument('--lambda_param', type=float, help='Override lambda parameter for all methods.')
+    sgroup.add_argument('--lambda', dest='reward_lambda', type=float, default=1.0,
+                        help='Inverse temperature of the target p e^{lambda r}: DTS uses lambda * r, FK weights use lambda.')
     sgroup.add_argument('--guiding_reward_fns', nargs='+', default=['ImageReward'], help='Guiding reward function(s).')
     sgroup.add_argument('--maximize', action='store_true',
                         help='DTS*: argmax selection in tree construction and traversal (default: DTS, sampling by value).')
@@ -124,8 +125,8 @@ def parse_script_args():
         config.sampling.compute_budget = args.compute_budget
     if args.population_size is not None: config.sampling.population_size = args.population_size
     if args.potential_type is not None: config.fkd.potential_type = args.potential_type
-    if args.lambda_param is not None:
-        config.fkd.lambda_param = args.lambda_param
+    config.fkd.lambda_param = args.reward_lambda
+    config.reward_lambda = args.reward_lambda
     config.guiding_reward_fns = args.guiding_reward_fns
 
     if 'AestheticScore' in config.guiding_reward_fns:
@@ -248,7 +249,7 @@ def run_mcts(config, prompt, reward_name, pipeline):
     metrics_data = {}
 
     reward = RewardCounter(lambda images_pil: get_reward_function(
-        reward_name=reward_name, images=images_pil, prompts=[prompt] * len(images_pil)))
+        reward_name=reward_name, images=images_pil, prompts=[prompt] * len(images_pil)), scale=config.reward_lambda)
 
     mcts_sampler = MCTSStableDiffusionSampler(
         pipeline=pipeline,
@@ -271,25 +272,29 @@ def run_mcts(config, prompt, reward_name, pipeline):
         output_dir=str(Path(config.paths.image_dir)),
         visualization_timesteps=list(config.mcts.expand_timesteps + [0]),
         pw_alpha_root=config.pw_alpha_root,
+        negative_prompt=config.dataset.negative_prompt,
     )
     mcts_sampler.initialize_root_nodes()
     reset_peak_memory()
-    build_time = 0.0
+    build_time, build_reward_evals = 0.0, 0
 
     for target_nfes in config.sampling.compute_budget:
+        reward.reset()
         t0 = time.time()
         mcts_sampler.build_search_tree(num_nfes=target_nfes)
         if torch.cuda.is_available(): torch.cuda.synchronize()
         build_time += time.time() - t0
-        build_reward_evals = reward.n_evals
+        build_reward_evals += reward.n_evals
         t1 = time.time()
         sampled_images, _ = mcts_sampler.sample_from_tree(population_size=config.sampling.population_size)
+        if torch.cuda.is_available(): torch.cuda.synchronize()
         sample_time = time.time() - t1
+        peak_mem = peak_memory_mb()
 
         metrics = evaluate_images(sampled_images, prompt, config)
         metrics.update({'NFEs': target_nfes, 'ActualNFEs': mcts_sampler.nfes, 'BuildTime': build_time,
                         'SampleTime': sample_time, 'Time': build_time + sample_time,
-                        'RewardEvals': build_reward_evals, 'PeakMemMB': peak_memory_mb()})
+                        'RewardEvals': build_reward_evals, 'PeakMemMB': peak_mem})
         finish_nfe_point(sampled_images, metrics, method_name, prompt, reward_name, target_nfes, config)
         metrics_data[target_nfes] = metrics
 
@@ -298,8 +303,9 @@ def run_mcts(config, prompt, reward_name, pipeline):
 
 @torch.no_grad()
 def run_bon(config, prompt, reward_name, pipeline):
-    """Best-of-N: N = NFE // T prior samples (prefixes of one generated set for smaller budgets);
-    the single sample with the highest guiding reward is returned."""
+    """Best-of-N: N = NFE // T prior samples (prefixes of one generated set for smaller budgets).
+    The sample with the highest guiding reward is the output; it is repeated population_size times
+    so every method is evaluated on the same number of images (Distinct = 1)."""
     metrics_data = {}
     num_steps = config.sampling.num_inference_steps
     n_list = [max(1, nfe // num_steps) for nfe in config.sampling.compute_budget]
@@ -315,12 +321,15 @@ def run_bon(config, prompt, reward_name, pipeline):
                            eta=config.sampling.eta, output_type="pil").images
             images.extend(out)
             rewards.extend(get_reward_function(reward_name=reward_name, images=out, prompts=[prompt] * b))
+        if torch.cuda.is_available(): torch.cuda.synchronize()
         gen_time += time.time() - t0
+        peak_mem = peak_memory_mb()
         best = int(np.argmax(rewards[:n_candidates]))
-        metrics = evaluate_images([images[best]], prompt, config)
+        eval_images = [images[best]] * config.sampling.population_size
+        metrics = evaluate_images(eval_images, prompt, config)
         metrics.update({'NFEs': nfe, 'ActualNFEs': n_candidates * num_steps, 'ActualParticles': n_candidates,
-                        'Time': gen_time, 'RewardEvals': n_candidates, 'PeakMemMB': peak_memory_mb()})
-        finish_nfe_point([images[best]], metrics, "BoN", prompt, reward_name, nfe, config)
+                        'Time': gen_time, 'RewardEvals': n_candidates, 'PeakMemMB': peak_mem})
+        finish_nfe_point(eval_images, metrics, "BoN", prompt, reward_name, nfe, config)
         metrics_data[nfe] = metrics
     return metrics_data
 
@@ -368,13 +377,14 @@ def run_fkd(config, prompt, reward_name, pipeline):
         )
         if torch.cuda.is_available(): torch.cuda.synchronize()
         elapsed = time.time() - t0
+        peak_mem = peak_memory_mb()
         w = torch.softmax(out.log_weights.double(), dim=0)
         idx = torch.multinomial(w, config.sampling.population_size, replacement=True).tolist()
         eval_images = [out.images[i] for i in idx]
         metrics = evaluate_images(eval_images, prompt, config)
         metrics.update({'NFEs': nfe_target, 'ActualNFEs': out.nfes, 'ActualParticles': n_particles,
                         'FinalWeightESS': float(1.0 / (w.pow(2).sum() * n_particles)),
-                        'Time': elapsed, 'RewardEvals': pipeline.reward_evals, 'PeakMemMB': peak_memory_mb()})
+                        'Time': elapsed, 'RewardEvals': pipeline.reward_evals, 'PeakMemMB': peak_mem})
         finish_nfe_point(eval_images, metrics, method_name, prompt, reward_name, nfe_target, config)
         metrics_data[nfe_target] = metrics
 
@@ -549,10 +559,13 @@ def worker_process(gpu_id, config, prompt_subset):
         # for reward_name in current_config.eval.reward_fns:
         for reward_name in current_config.guiding_reward_fns:
             logger.info(f"[GPU {gpu_id}] Guiding with Reward: {reward_name} for {method}")
-            method_guidance_id = f"{method}_guided_by_{reward_name}" # NEW: Create unique ID
+            method_label = method + ("-max" if method.startswith("MCTS") and current_config.maximize else "")
+            method_guidance_id = f"{method_label}_guided_by_{reward_name}"
             prompt_results_dfs_for_reward = [] # Store DFs for this specific method, reward, and its prompts
             for prompt in prompt_subset:
                 logger.info(f"[GPU {gpu_id}] Prompt: '{prompt}'")
+                # same seed for every method on a prompt, independent of the GPU assignment
+                seed_experiment(current_config.common.seed + current_config.dataset.prompts.index(prompt))
                 try:
                     results_dict = run_fn(current_config, prompt, reward_name, pipeline)
                     df = save_results_to_csv(results_dict, prompt, None, method_guidance_id, current_config, save=False)

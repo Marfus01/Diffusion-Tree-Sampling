@@ -558,11 +558,14 @@ class FKDDDIMPipeline(DDIMPipeline):
                 prev_image = prev_image + shift
                 if weights is not None:
                     weights.add_log_ratio(gaussian_step_log_ratio(prev_image, prev_image_mean, shift, variance))
+            if weights is not None:
+                weights.invalidate(~torch.isfinite(prev_image).flatten(1).all(dim=1))
             image = prev_image
 
         log_weights = torch.zeros(num_particles, device=device)
         if weights is not None:
             weights.final_step(batched_reward(image))
             log_weights = weights.log_w
-            logger.info(f"Final ESS ratio {weights.ess_ratio():.3f}; resampling events {weights.num_resampling_events}")
+            logger.info(f"Final ESS ratio {weights.ess_ratio():.3f}; resampling events {weights.num_resampling_events}; "
+                        f"invalid particles {weights.num_invalid}")
         return SMCOutput(images=image, log_weights=log_weights, nfes=self.nfes)

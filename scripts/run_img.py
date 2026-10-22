@@ -24,6 +24,7 @@ from src.utils.datasets import get_img_dataset
 from src.models.classifier import get_train_classifier
 from src.models.diffusion_img import get_diffusion_model
 from src.core.config import get_default_image_config, process_image_config
+from src.core.smc_weights import SMCDivergedError
 from src.utils.run_logging import RewardCounter, write_run_meta, reset_peak_memory, peak_memory_mb, distinct_count
 from src.evaluation.image_metrics import (
     compute_fid,
@@ -91,7 +92,6 @@ def parse_script_args():
     sgroup.add_argument('--compute_budget', nargs='+', type=int, help='Override compute budget in NFEs.')
     sgroup.add_argument('--population_size', type=int, help='Override final population size.')
     sgroup.add_argument('--potential_type', type=str, help='Override potential type for FKD.')
-    sgroup.add_argument('--lambda_param', type=float, help='Override temperature parameter for all methods.')
     sgroup.add_argument('--guidance_scale', type=float, default=1.0, help='Scale for reward-based guidance.')
     sgroup.add_argument('--lambda', dest='reward_lambda', type=float, default=1.0,
                         help='Inverse temperature of the target p e^{lambda r}: every method uses lambda * r.')
@@ -129,8 +129,6 @@ def parse_script_args():
         config.sampling.compute_budget = sorted(args.compute_budget)
     if args.population_size is not None: config.sampling.population_size = args.population_size
     if args.potential_type is not None: config.fkd.potential_type = args.potential_type
-    if args.lambda_param is not None:
-        config.fkd.lambda_param = args.lambda_param
     if args.guidance_scale is not None:
         config.guidance_scale = args.guidance_scale # Store guidance scale in config
 
@@ -315,21 +313,24 @@ def run_mcts(config, args, run_class_name, target_class_list, classifier,
     )
     mcts_sampler.initialize_root_nodes()
     reset_peak_memory()
-    build_time = 0.0
+    build_time, build_reward_evals = 0.0, 0
 
     for target_nfes in config.sampling.compute_budget:
+        reward.reset()
         t0 = time.time()
         mcts_sampler.build_search_tree(num_nfes=target_nfes)
+        if torch.cuda.is_available(): torch.cuda.synchronize()
         build_time += time.time() - t0
-        build_reward_evals = reward.n_evals
+        build_reward_evals += reward.n_evals
         t1 = time.time()
         sampled_images, _ = mcts_sampler.sample_from_tree(population_size=config.sampling.population_size)
         sample_time = time.time() - t1
+        peak_mem = peak_memory_mb()
 
         metrics = evaluate_images(sampled_images, real_loader, target_class_list, classifier, inception_model, config)
         metrics.update({'NFEs': target_nfes, 'ActualNFEs': mcts_sampler.nfes, 'BuildTime': build_time,
                         'SampleTime': sample_time, 'Time': build_time + sample_time,
-                        'RewardEvals': build_reward_evals, 'PeakMemMB': peak_memory_mb()})
+                        'RewardEvals': build_reward_evals, 'PeakMemMB': peak_mem})
         finish_nfe_point(sampled_images, metrics, method_name, run_class_name, target_nfes, output_dir_mcts_images, config, args)
         metrics_data[target_nfes] = metrics
 
@@ -378,24 +379,34 @@ def run_smc(config, args, run_class_name, target_class_list, classifier,
         reward.reset()
         reset_peak_memory()
         t0 = time.time()
-        out = pipeline.sample_batched_smc(
-            num_particles=n_particles,
-            processing_batch_size=config.fkd.batch_size,
-            num_inference_steps=num_steps,
-            use_smc=use_smc,
-            use_guidance=use_guidance,
-            use_tempering=use_tempering,
-            use_rollout=use_rollout,
-            guidance_scale=config.guidance_scale,
-            reward_fn=reward,
-            fkd_config=fkd_config_dict,
-            device=config.common.device,
-            eta=config.sampling.eta,
-            das_gamma=args.das_gamma,
-            use_progress_bar=config.common.use_progress_bar,
-        )
+        try:
+            out = pipeline.sample_batched_smc(
+                num_particles=n_particles,
+                processing_batch_size=config.fkd.batch_size,
+                num_inference_steps=num_steps,
+                use_smc=use_smc,
+                use_guidance=use_guidance,
+                use_tempering=use_tempering,
+                use_rollout=use_rollout,
+                guidance_scale=config.guidance_scale,
+                reward_fn=reward,
+                fkd_config=fkd_config_dict,
+                device=config.common.device,
+                eta=config.sampling.eta,
+                das_gamma=args.das_gamma,
+                use_progress_bar=config.common.use_progress_bar,
+            )
+            if use_smc and not torch.isfinite(out.log_weights).any():
+                raise SMCDivergedError("SMC population has no particle with a finite weight (diverged).")
+        except SMCDivergedError as e:
+            logger.error(f"  {method_name} NFE {nfe_target} ({n_particles} particles): {e}")
+            metrics_data[nfe_target] = {'NFEs': nfe_target, 'ActualParticles': n_particles, 'Diverged': 1,
+                                        'Time': time.time() - t0}
+            continue
+        if torch.cuda.is_available(): torch.cuda.synchronize()
         run_time = time.time() - t0
         run_reward_evals = reward.n_evals
+        peak_mem = peak_memory_mb()
         particles = out.images
         if use_smc:
             idx = torch.multinomial(torch.softmax(out.log_weights.double(), dim=0), n_eval, replacement=True)
@@ -409,7 +420,9 @@ def run_smc(config, args, run_class_name, target_class_list, classifier,
         metrics = evaluate_images(eval_samples, real_loader, target_class_list, classifier, inception_model, config)
         metrics.update({'NFEs': nfe_target, 'ActualNFEs': out.nfes, 'ActualParticles': n_particles,
                         'FinalWeightESS': float(1.0 / (w.pow(2).sum() * n_particles)),
-                        'Time': run_time, 'RewardEvals': run_reward_evals, 'PeakMemMB': peak_memory_mb()})
+                        'InvalidParticles': int((~torch.isfinite(out.log_weights)).sum()) if use_smc
+                                            else int((~torch.isfinite(particles).flatten(1).all(dim=1)).sum()),
+                        'Time': run_time, 'RewardEvals': run_reward_evals, 'PeakMemMB': peak_mem})
         finish_nfe_point(eval_samples, metrics, method_name, run_class_name, nfe_target, output_dir_method, config, args)
         metrics_data[nfe_target] = metrics
 

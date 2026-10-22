@@ -544,7 +544,9 @@ class FKDStableDiffusion(
             if do_classifier_free_guidance:
                 # For CFG, we need to slice both unconditional and conditional embeddings
                 # prompt_embeds layout: [uncond_0, cond_0, uncond_1, cond_1, ...]
-                current_batch_prompt_embeds = prompt_embeds[batch_start_idx*2 : batch_end_idx*2]
+                # reorder the interleaved [u_i, c_i] pairs to match cat([latents] * 2)
+                current_batch_prompt_embeds = torch.cat([prompt_embeds[batch_start_idx*2 : batch_end_idx*2 : 2],
+                                                         prompt_embeds[batch_start_idx*2 + 1 : batch_end_idx*2 : 2]])
             else:
                 current_batch_prompt_embeds = prompt_embeds[batch_start_idx:batch_end_idx]
             
@@ -1238,7 +1240,12 @@ class FKDStableDiffusion(
                     current_latents_batch = latents[batch_start_idx:batch_end_idx]
                     
                     # Slice prompt embeds: each particle has 2 (uncond, cond)
-                    current_prompt_embeds_batch = prompt_embeds_population[batch_start_idx*2 : batch_end_idx*2] if self.do_classifier_free_guidance else prompt_embeds_population[batch_start_idx:batch_end_idx]
+                    # prompt_embeds_population interleaves [u_0, c_0, u_1, c_1, ...]; the UNet input is
+                    # cat([latents] * 2), so the embeddings must be [u_0..u_{B-1}, c_0..c_{B-1}]
+                    current_prompt_embeds_batch = torch.cat([
+                        prompt_embeds_population[batch_start_idx*2 : batch_end_idx*2 : 2],
+                        prompt_embeds_population[batch_start_idx*2 + 1 : batch_end_idx*2 : 2],
+                    ]) if self.do_classifier_free_guidance else prompt_embeds_population[batch_start_idx:batch_end_idx]
 
                     current_added_cond_kwargs_batch = {}
                     if "image_embeds" in added_cond_kwargs and added_cond_kwargs["image_embeds"] is not None:
@@ -1355,8 +1362,10 @@ class FKDStableDiffusion(
         image = self.image_processor.postprocess(image, output_type=output_type, do_denormalize=do_denormalize)
 
         # terminal potential lambda * (r(x_0) - r~_last) on the final images
-        final_rewards = torch.tensor(get_reward_function(fkd_args["guidance_reward_fn"], images=list(image),
-                                                         prompts=[prompt_list[0]] * len(image)), device=device).float()
+        final_rewards = torch.tensor([r for b in range(0, len(image), reward_batch_size)
+                                      for r in get_reward_function(fkd_args["guidance_reward_fn"], images=list(image[b:b + reward_batch_size]),
+                                                                   prompts=[prompt_list[0]] * len(image[b:b + reward_batch_size]))],
+                                     device=device).float()
         weights.final_step(final_rewards)
         self.reward_evals += len(image)
 

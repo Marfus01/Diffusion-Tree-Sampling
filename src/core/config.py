@@ -292,7 +292,7 @@ class SDModelConfig:
 class SDSamplingConfig:
     num_inference_steps: int = 50
     compute_budget: List[int] = field(default_factory=lambda: [10, 50, 100])
-    population_size: int = 1 # Final # samples per prompt to save/evaluate
+    population_size: int = 16 # Final # samples per prompt to save/evaluate
     guidance_scale: float = 7.5
     eta: float = 1.0 # eta=1.0 for DDIM scheduler
 
