@@ -53,6 +53,42 @@ def test_posterior_component_moments(problem):
     np.testing.assert_allclose(mean_is, problem.posterior_means[k], atol=0.05)
 
 
+def test_target_mean_reward_matches_samples(problem):
+    x = problem.sample_target(200_000, seed=8)
+    r = problem.log_likelihood(torch.from_numpy(x)).double()
+    assert problem.target_mean_reward() == pytest.approx(r.mean().item(), abs=4 * r.std().item() / math.sqrt(len(r)))
+
+
+@pytest.mark.parametrize("lmbda", [1.0, 3.0])
+@pytest.mark.parametrize("abar", [0.5, 0.05])
+def test_log_soft_value_matches_monte_carlo(problem, lmbda, abar):
+    """log M_t against Monte Carlo over exact q_0|t draws, at x_t forward-noised from pi*_0 samples
+    (where the Monte Carlo estimate has enough effective samples)."""
+    p = GMMInverseProblem(dim=problem.dim, instance_seed=0, lmbda=lmbda)
+    g = torch.Generator().manual_seed(9)
+    x0_target = torch.from_numpy(p.sample_target(4, seed=11)).double()
+    x = math.sqrt(abar) * x0_target + math.sqrt(1 - abar) * torch.randn(4, p.dim, generator=g, dtype=torch.float64)
+    closed = p.log_soft_value(x, torch.full((4,), abar))
+    s = math.sqrt(abar)
+    for b in range(4):
+        diff = x[b][None] - s * p.means
+        w = torch.softmax(torch.log(p.weights) - 0.5 * diff.pow(2).sum(-1), 0)
+        n = 400_000
+        comp = torch.multinomial(w, n, replacement=True, generator=g)
+        x0 = p.means[comp] + s * diff[comp] + math.sqrt(1 - abar) * torch.randn(n, p.dim, generator=g, dtype=torch.float64)
+        lr = lmbda * p.log_likelihood(x0.float()).double()
+        mc = torch.logsumexp(lr, 0) - math.log(n)
+        ess = 1.0 / torch.softmax(lr, 0).pow(2).sum().item()
+        assert ess > 1000, (b, ess)
+        assert closed[b].item() == pytest.approx(mc.item(), abs=5 / math.sqrt(ess)), (b, ess)
+
+
+def test_log_soft_value_at_clean_level_is_reward(problem):
+    x = torch.from_numpy(problem.sample_target(16, seed=10)).double()
+    np.testing.assert_allclose(problem.log_soft_value(x, torch.ones(16)).numpy(),
+                               problem.log_likelihood(x.float()).double().numpy(), atol=1e-4)
+
+
 def test_target_samples_component_counts(problem):
     x = problem.sample_target(20_000, seed=4)
     assert problem.mode_mass_tv(x) < 0.02

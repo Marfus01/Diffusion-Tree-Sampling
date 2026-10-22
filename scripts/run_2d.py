@@ -205,17 +205,10 @@ def dup_ess(samples_np, population_size):
     return float(1.0 / np.sum(w ** 2)) / population_size
 
 
-def run_mcts(config, args, dataset_name, diffusion_model, task, problem, reward, method_name="MCTS"):
-    """Runs MCTS or DTS (MCTS-Rollout). Smaller NFE budgets are snapshots of one growing tree."""
-    logger.info(f"--- Running {method_name} for {dataset_name} ---")
-    metrics_data, value_errors, samples_by_nfe, nodes_by_timestep_all_iters = {}, {}, {}, {}
-    use_rollout = ("-R" in method_name or "Rollout" in method_name)
-    value_eval_timesteps = config.eval.value_eval_timesteps if config.eval.evaluate_value else None
-    reward_np = lambda x: reward(x).detach().cpu().numpy()
-
+def make_mcts_sampler(config, args, diffusion_model, reward_np, use_rollout):
     eps_init = args.eps_explore if args.eps_explore is not None else 0.1
     eps_final = args.eps_explore if args.eps_explore is not None else 0.05
-    mcts_sampler = MCTSDiffusionSampler(
+    return MCTSDiffusionSampler(
         diffusion_model=diffusion_model,
         reward_fn=reward_np,
         expand_timesteps=config.mcts.expand_timesteps,
@@ -236,6 +229,16 @@ def run_mcts(config, args, dataset_name, diffusion_model, task, problem, reward,
         pw_alpha=args.pw_alpha,
         pw_alpha_root=args.pw_alpha_root,
     )
+
+
+def run_mcts(config, args, dataset_name, diffusion_model, task, problem, reward, method_name="MCTS"):
+    """Runs MCTS or DTS (MCTS-Rollout). Smaller NFE budgets are snapshots of one growing tree."""
+    logger.info(f"--- Running {method_name} for {dataset_name} ---")
+    metrics_data, value_errors, samples_by_nfe, nodes_by_timestep_all_iters = {}, {}, {}, {}
+    use_rollout = ("-R" in method_name or "Rollout" in method_name)
+    value_eval_timesteps = config.eval.value_eval_timesteps if config.eval.evaluate_value else None
+    reward_np = lambda x: reward(x).detach().cpu().numpy()
+    mcts_sampler = make_mcts_sampler(config, args, diffusion_model, reward_np, use_rollout)
     mcts_sampler.initialize_root_nodes()
     reset_peak_memory()
     build_time, build_reward_evals = 0.0, 0

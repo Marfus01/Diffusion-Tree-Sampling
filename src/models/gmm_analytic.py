@@ -109,6 +109,39 @@ class GMMInverseProblem:
         return -0.5 * resid.pow(2).sum(-1) / self.sigma_y ** 2 \
             - 0.5 * self.dim_y * math.log(2 * math.pi * self.sigma_y ** 2)
 
+    def target_mean_reward(self) -> float:
+        """E_{pi*_0}[r] in closed form: sum_k w~_k (-(|y - A m_k|^2 + tr(A Sigma A^T)) / (2 sigma_y^2)) + const."""
+        post = self._posterior
+        resid = self.y[None, :] - post['means'] @ self.A.T                           # [K, d_y]
+        quad = resid.pow(2).sum(-1) + torch.trace(self.A @ post['cov'] @ self.A.T)
+        r = -0.5 * quad / self.sigma_y ** 2 - 0.5 * self.dim_y * math.log(2 * math.pi * self.sigma_y ** 2)
+        return float((post['weights'] * r).sum())
+
+    def log_soft_value(self, x: torch.Tensor, abar: torch.Tensor) -> torch.Tensor:
+        """log M_t(lambda | x_t) = log E_{q_0|t(x_0 | x_t)}[e^{lambda r(x_0)}] in closed form (float64).
+
+        x [B, d] at noise level abar [B]. With q_0|t = sum_k w~_k(x_t) N(m_k(x_t), (1 - abar) I),
+        m_k = mu_k + sqrt(abar) (x_t - sqrt(abar) mu_k), w~_k ∝ w_k N(x_t; sqrt(abar) mu_k, I) and
+        e^{lambda r} = c_lambda N(y; A x_0, sigma_y^2 / lambda I),
+        M_t = c_lambda sum_k w~_k N(y; A m_k, sigma_y^2 / lambda I + (1 - abar) A A^T),
+        log c_lambda = (d_y / 2) ((1 - lambda) log(2 pi sigma_y^2) - log lambda). At abar = 1 this is
+        lambda r(x)."""
+        lam = self.lmbda
+        x = x.double().cpu()
+        abar = abar.double().cpu()
+        s = abar.sqrt()[:, None, None]                                                 # [B, 1, 1]
+        diff = x[:, None, :] - s * self.means[None]                                    # [B, K, d]
+        log_wt = torch.log_softmax(torch.log(self.weights)[None] - 0.5 * diff.pow(2).sum(-1), dim=1)
+        m = self.means[None] + s * diff                                                # [B, K, d]
+        resid = self.y[None, None, :] - m @ self.A.T                                   # [B, K, d_y]
+        eye = torch.eye(self.dim_y, dtype=torch.float64)
+        cov = (self.sigma_y ** 2 / lam) * eye[None] + (1 - abar)[:, None, None] * (self.A @ self.A.T)[None]
+        prec = torch.linalg.inv(cov)                                                   # [B, d_y, d_y]
+        log_n = -0.5 * torch.einsum('bki,bij,bkj->bk', resid, prec, resid) \
+            - 0.5 * torch.logdet(2 * math.pi * cov)[:, None]
+        log_c = 0.5 * self.dim_y * ((1 - lam) * math.log(2 * math.pi * self.sigma_y ** 2) - math.log(lam))
+        return log_c + torch.logsumexp(log_wt + log_n, dim=1)
+
     # ---- diffusion prior ----
     def eps_star(self, x: torch.Tensor, abar: torch.Tensor) -> torch.Tensor:
         """Exact noise prediction; x [B, d], abar [B] (alphas_cumprod at each sample's index)."""
