@@ -7,7 +7,8 @@ one step. The best and runner-up configuration of each method's last stage are r
 A configuration whose samples are non-finite or whose SMC population diverges on any seed is
 ineligible (SW = inf). `collapsed` counts seeds whose mode-mass TV exceeds 0.5. Every run_2d call is one method and one
 configuration; results stay in the run_2d output tree, and summary.json / summary.md are written
-to <base_dir>/toy/m1_calibration/.
+to <base_dir>/toy/<--name>/. `--chains` restricts the calibration to some method chains (DAS
+inherits the TDS scale, so TDS and DAS form one chain); `--tds_scales` replaces the TDS scale grid.
 """
 import argparse
 import json
@@ -55,11 +56,11 @@ class Runner:
     def __init__(self, args):
         self.args = args
         self.pool = ThreadPoolExecutor(max_workers=args.workers)
-        self.log_dir = Path(args.base_dir) / 'toy' / 'm1_calibration' / 'logs'
+        self.log_dir = Path(args.base_dir) / 'toy' / args.name / 'logs'
         self.log_dir.mkdir(parents=True, exist_ok=True)
 
     def submit(self, dim, method, params, nfe, num_seeds):
-        name = f"calib_n{nfe}_{tag(method, params)}"
+        name = f"{self.args.run_prefix}_n{nfe}_{tag(method, params)}"
         cmd = [sys.executable, '-m', 'scripts.run_2d', '--dataset', 'gmm', '--gmm_dim', str(dim),
                '--gmm_instance', str(self.args.instance), '--seed', '0', '--num_seeds', str(num_seeds),
                '--compute_budget', str(nfe), '--device', 'cpu', '--no_progress_bar', '--no_save_samples',
@@ -87,9 +88,10 @@ class Runner:
         return row
 
     def stage(self, dim, method, base, key, values, results):
+        """A scale that wins at the edge of SCALES is extended once; a replacement grid is not."""
         futures = [self.submit(dim, method, {**base, key: v}, self.args.nfe, self.args.num_seeds) for v in values]
         rows = [f.result() for f in futures]
-        if key == 'scale':
+        if key == 'scale' and values == SCALES:
             best = min(rows, key=lambda r: r['SW'])
             ext = SCALE_EXTENSION.get(best['params']['scale'])
             if ext is not None and all(r['params']['scale'] != ext for r in rows):
@@ -117,7 +119,7 @@ def calibrate_dim(runner, dim, results):
         final['DPS-RG'] = runner.stage(dim, 'DPS-RG', {}, 'scale', SCALES, results)
 
     def tds_das():
-        tds_scale = runner.stage(dim, 'TDS', {}, 'scale', SCALES, results)[0]['params']['scale']
+        tds_scale = runner.stage(dim, 'TDS', {}, 'scale', runner.args.tds_scales, results)[0]['params']['scale']
         final['TDS'] = schedule_stage('TDS', {'scale': tds_scale})
         gamma = runner.stage(dim, 'DAS', {'scale': tds_scale}, 'gamma', DAS_GAMMAS, results)[0]['params']['gamma']
         final['DAS'] = schedule_stage('DAS', {'scale': tds_scale, 'gamma': gamma})
@@ -126,8 +128,9 @@ def calibrate_dim(runner, dim, results):
         alpha = runner.stage(dim, 'DTS', {}, 'alpha', DTS_ALPHAS, results)[0]['params']['alpha']
         final['DTS'] = runner.stage(dim, 'DTS', {'alpha': alpha}, 'eps', DTS_EPS, results)
 
-    with ThreadPoolExecutor(max_workers=4) as chains:
-        for f in [chains.submit(fn) for fn in (fk, dps, tds_das, dts)]:
+    chains = {'FK': fk, 'DPS-RG': dps, 'TDS-DAS': tds_das, 'DTS': dts}
+    with ThreadPoolExecutor(max_workers=len(runner.args.chains)) as pool:
+        for f in [pool.submit(chains[c]) for c in runner.args.chains]:
             f.result()
     return final
 
@@ -164,9 +167,14 @@ def main():
     ap.add_argument('--recheck_seeds', type=int, default=3)
     ap.add_argument('--workers', type=int, default=os.cpu_count())
     ap.add_argument('--base_dir', default=os.environ.get('DTS_BASE_DIR'))
+    ap.add_argument('--chains', nargs='+', choices=['FK', 'DPS-RG', 'TDS-DAS', 'DTS'],
+                    default=['FK', 'DPS-RG', 'TDS-DAS', 'DTS'])
+    ap.add_argument('--tds_scales', nargs='+', type=float, default=SCALES)
+    ap.add_argument('--name', default='m1_calibration', help='output directory under <base_dir>/toy/')
+    ap.add_argument('--run_prefix', default='calib', help='prefix of the run_2d exp_name of each run')
     args = ap.parse_args()
     runner = Runner(args)
-    out_dir = Path(args.base_dir) / 'toy' / 'm1_calibration'
+    out_dir = Path(args.base_dir) / 'toy' / args.name
 
     results, finals = [], {}
     with ThreadPoolExecutor(max_workers=len(args.dims)) as dims:
