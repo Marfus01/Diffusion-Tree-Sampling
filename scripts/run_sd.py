@@ -12,6 +12,7 @@ import pprint
 from dataclasses import asdict
 import multiprocessing
 import copy
+import os
 import sys
 import time
 
@@ -23,6 +24,7 @@ from src.core.sampling_sd.mcts_sd import MCTSStableDiffusionSampler
 from src.core.sampling_sd.fkd_sd import FKDStableDiffusion
 from src.core.rewards import get_reward_function, do_clip_score_diversity
 from src.core.config import get_default_sd_config, process_sd_config
+from src.utils.run_logging import RewardCounter, write_run_meta, reset_peak_memory, peak_memory_mb
 
 # Setup logging
 handler = colorlog.StreamHandler()
@@ -64,6 +66,8 @@ def parse_script_args():
     cgroup.add_argument('--device', type=str, help='Override device.')
     cgroup.add_argument('--no_progress_bar', action='store_true', help='Override whether to use progress bar.')    
     cgroup.add_argument('--hf_home', type=str, help='Override HuggingFace cache directory (HF_HOME).')
+    cgroup.add_argument('--base_dir', type=str, help='Experiment root (default $DTS_BASE_DIR or ~/mcts/experiments).')
+    cgroup.add_argument('--no_compile', action='store_true', help='Do not compile the UNet / VAE / ImageReward with TensorRT.')
 
     # --- Method Enabling ---
     mgroup = parser.add_argument_group('Method Selection')
@@ -78,7 +82,13 @@ def parse_script_args():
     sgroup.add_argument('--population_size', type=int, help='Number of final # samples per prompt.')
     sgroup.add_argument('--potential_type', type=str, help='Override potential type for FKD.')
     sgroup.add_argument('--lambda_param', type=float, help='Override lambda parameter for all methods.')
-    sgroup.add_argument('--guiding_reward_fns', nargs='+', help='Override guiding reward function.')
+    sgroup.add_argument('--guiding_reward_fns', nargs='+', default=['ImageReward'], help='Guiding reward function(s).')
+    sgroup.add_argument('--maximize', action='store_true',
+                        help='DTS*: argmax selection in tree construction and traversal (default: DTS, sampling by value).')
+    sgroup.add_argument('--pw_alpha_root', type=float, default=0.8,
+                        help='Meta-root widening exponent of DTS/DTS* (0.8 as used by the authors for T2I, issue #2; code default 0.4).')
+    sgroup.add_argument('--adaptive_resampling', type=lambda v: v.lower() in ('1', 'true', 'yes'),
+                        help='ESS-adaptive resampling for FK (true/false).')
 
     args = parser.parse_args()
     config = get_default_sd_config()
@@ -101,7 +111,13 @@ def parse_script_args():
     if args.do_mcts: config.mcts.enabled = True
     if args.do_mcts_rollout: config.mcts_rollout = True # Using a temporary attribute
     if args.do_fkd: config.fkd.enabled = True
-    if args.do_bon: config.bon.enabled = True
+    config.bon_enabled = args.do_bon
+    config.maximize = args.maximize
+    config.pw_alpha_root = args.pw_alpha_root
+    config.no_compile = args.no_compile
+    if args.no_compile: os.environ["DTS_NO_COMPILE"] = "1"
+    if args.base_dir is not None: config.common.base_dir = args.base_dir
+    if args.adaptive_resampling is not None: config.fkd.adaptive_resampling = args.adaptive_resampling
 
 
     if args.compute_budget is not None:
@@ -110,7 +126,7 @@ def parse_script_args():
     if args.potential_type is not None: config.fkd.potential_type = args.potential_type
     if args.lambda_param is not None:
         config.fkd.lambda_param = args.lambda_param
-    if args.guiding_reward_fns is not None: config.guiding_reward_fns = args.guiding_reward_fns
+    config.guiding_reward_fns = args.guiding_reward_fns
 
     if 'AestheticScore' in config.guiding_reward_fns:
         config.mcts.exploration_const = 40.0
@@ -118,6 +134,7 @@ def parse_script_args():
         config.mcts.exploration_const = 0.1
 
     config = process_sd_config(config)
+    write_run_meta(config.paths.run_dir, config, args)
 
     return config
 
@@ -208,31 +225,35 @@ def save_results_to_csv(metrics_data, prompt, output_path, method_name, config, 
     return df
 
 
+def _prompt_slug(prompt):
+    return "".join(c if c.isalnum() else "_" for c in prompt)[:60]
+
+
+def finish_nfe_point(images, metrics, method_name, prompt, reward_name, target_nfes, config):
+    """Saves the evaluation images (PNG) and logs one NFE point."""
+    out_dir = Path(config.paths.image_dir) / reward_name / method_name / _prompt_slug(prompt) / f"N{target_nfes}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for k, img in enumerate(images):
+        img.save(out_dir / f"{k:03d}.png")
+    metrics['Distinct'] = len({img.tobytes() for img in images})
+    logger.info(f"  {method_name} '{prompt[:40]}' NFE {target_nfes}: " +
+                ", ".join(f"{k}={v:.4g}" for k, v in metrics.items() if isinstance(v, (int, float, np.floating))))
+
+
 @torch.no_grad()
 def run_mcts(config, prompt, reward_name, pipeline):
-    """Run MCTS-guided Stable Diffusion generation."""
-    logger.info(f"--- Running MCTS for prompt: '{prompt}' ---")
-    # Setup memory logging
-    method_name = "MCTS-R" if config.mcts.use_rollout else "MCTS"
-    log_file_prefix = Path(config.paths.metrics_dir) / f"gpu_memory_{method_name}.txt"
-    log_file_prefix.parent.mkdir(parents=True, exist_ok=True)
+    """DTS (rollouts) or DTS* (rollouts + maximize); NFE budgets are snapshots of one growing tree."""
+    method_name = ("MCTS-R" if config.mcts.use_rollout else "MCTS") + ("-max" if config.maximize else "")
+    logger.info(f"--- Running {method_name} for prompt: '{prompt}' ---")
     metrics_data = {}
 
-    reward_fn_mcts = lambda images_pil: get_reward_function(
-        reward_name=reward_name,
-        images=images_pil,
-        prompts=[prompt] * len(images_pil),
-    )
-
-    # Create output directory for MCTS images
-    dir_name = "mcts-r" if config.mcts.use_rollout else "mcts"
-    output_dir_mcts_images = Path(config.paths.image_dir) / reward_name / dir_name
-    output_dir_mcts_images.mkdir(parents=True, exist_ok=True)
+    reward = RewardCounter(lambda images_pil: get_reward_function(
+        reward_name=reward_name, images=images_pil, prompts=[prompt] * len(images_pil)))
 
     mcts_sampler = MCTSStableDiffusionSampler(
         pipeline=pipeline,
         prompt=prompt,
-        reward_fn=reward_fn_mcts,
+        reward_fn=reward,
         expand_timesteps=config.mcts.expand_timesteps,
         num_inference_steps=config.sampling.num_inference_steps,
         eta=config.sampling.eta,
@@ -244,177 +265,72 @@ def run_mcts(config, prompt, reward_name, pipeline):
         progressive_width_alpha=config.mcts.progressive_width_alpha,
         use_progress_bar=config.common.use_progress_bar,
         use_rollout=config.mcts.use_rollout,
-        maximize=False,
+        maximize=config.maximize,
         exploration_type='ucb',
         batch_size=config.mcts.batch_size,
-        output_dir=str(output_dir_mcts_images),
+        output_dir=str(Path(config.paths.image_dir)),
         visualization_timesteps=list(config.mcts.expand_timesteps + [0]),
+        pw_alpha_root=config.pw_alpha_root,
     )
-
     mcts_sampler.initialize_root_nodes()
+    reset_peak_memory()
+    build_time = 0.0
 
-    # Run MCTS progressively for each target iteration count
-    for target_nfes in sorted(config.sampling.compute_budget):
-        # Reset memory stats for this NFE iteration
-        if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats()
-        # logger.info(f"MCTS NFE {target_nfes}")
-
-        # Timing the sampling phase
-        start_time = time.time()
-
-        # Build search tree
+    for target_nfes in config.sampling.compute_budget:
+        t0 = time.time()
         mcts_sampler.build_search_tree(num_nfes=target_nfes)
+        if torch.cuda.is_available(): torch.cuda.synchronize()
+        build_time += time.time() - t0
+        build_reward_evals = reward.n_evals
+        t1 = time.time()
+        sampled_images, _ = mcts_sampler.sample_from_tree(population_size=config.sampling.population_size)
+        sample_time = time.time() - t1
 
-        # Sample images
-        sampled_images, _ = mcts_sampler.sample_from_tree(
-            population_size=config.sampling.population_size,
-        )
-
-        # Log sampling time
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        elapsed = time.time() - start_time
-        with open(log_file_prefix, 'a') as f:
-            f.write(f"{method_name} NFE {target_nfes}: sampling time {elapsed:.4f}s\n")
-
-        # Log memory usage after this NFE iteration
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-            curr = torch.cuda.memory_allocated()
-            peak = torch.cuda.max_memory_allocated()
-            with open(log_file_prefix, 'a') as f:
-                f.write(f"{method_name} NFE {target_nfes}: current {curr/1024**2:.2f}MB, peak {peak/1024**2:.2f}MB\n")
-
-        # Evaluate metrics
         metrics = evaluate_images(sampled_images, prompt, config)
-        metrics['NFEs'] = target_nfes
+        metrics.update({'NFEs': target_nfes, 'ActualNFEs': mcts_sampler.nfes, 'BuildTime': build_time,
+                        'SampleTime': sample_time, 'Time': build_time + sample_time,
+                        'RewardEvals': build_reward_evals, 'PeakMemMB': peak_memory_mb()})
+        finish_nfe_point(sampled_images, metrics, method_name, prompt, reward_name, target_nfes, config)
         metrics_data[target_nfes] = metrics
-
-        # Save image grid
-        grid_path = output_dir_mcts_images / f"{prompt.replace(' ', '_')}_{target_nfes}.png"
-        rows = int(math.ceil(np.sqrt(len(sampled_images))))
-        cols = int(math.ceil(len(sampled_images) / rows))
-        image_grid = make_image_grid(sampled_images, rows=rows, cols=cols)
-        image_grid.save(grid_path)
 
     return metrics_data
 
 
 @torch.no_grad()
-def run_bon(config, prompt, base_pipeline):
-    """Run Best-of-N generation."""
-    metrics_data = {}  # {n_candidates: metrics_dict}
-    all_base_samples_pil = {}  # {n_candidates: list_of_pil_images}
-    all_base_samples_pt = {}   # {n_candidates: tensor_of_images}
-    generated_samples_pt = [] # Store all generated tensors incrementally
-
-    if base_pipeline is None:
-        logger.error("Base pipeline is None, cannot run Best-of-N.")
-        return metrics_data, all_base_samples_pil, all_base_samples_pt
-
-    # Use candidate counts from FKD config for N values
-    n_candidate_list = sorted(config.fkd.particles)
-    max_n_candidates = max(n_candidate_list)
-    # Use a reasonable batch size for generation
-    gen_batch_size = config.eval.eval_batch_size # Reuse eval batch size
-
-    logger.info(f"Generating up to {max_n_candidates} base samples...")
-    for i in range(0, max_n_candidates, gen_batch_size):
-        current_batch_size = min(gen_batch_size, max_n_candidates - i)
-        logger.debug(f"Generating base batch {i // gen_batch_size + 1}/{(max_n_candidates + gen_batch_size - 1) // gen_batch_size} ({current_batch_size} samples)")
-        try:
-            output = base_pipeline(
-                prompt=[prompt] * current_batch_size,
-                negative_prompt=[config.dataset.negative_prompt] * current_batch_size,
-                num_inference_steps=config.sampling.num_inference_steps,
-                guidance_scale=config.sampling.guidance_scale,
-                eta=config.sampling.eta,
-                output_type="pt",
-            ).images
-            generated_samples_pt.append(output.to(config.common.device))
-        except Exception as e:
-            logger.error(f"Error during base sample generation batch: {e}")
-            # Should we continue or stop? Stop for now.
-            return metrics_data, all_base_samples_pil, all_base_samples_pt
-
-    if not generated_samples_pt:
-         logger.error("No base samples were generated.")
-         return metrics_data, all_base_samples_pil, all_base_samples_pt
-
-    all_generated_pt = torch.cat(generated_samples_pt, dim=0)
-    logger.info(f"Generated {all_generated_pt.shape[0]} base samples total.")
-
-    # Evaluate for each N in the candidate list
-    for n_candidates in n_candidate_list:
-        logger.info(f"Evaluating Best-of-N for N = {n_candidates}")
-        if n_candidates > all_generated_pt.shape[0]:
-            logger.warning(f"Requested N={n_candidates} but only {all_generated_pt.shape[0]} samples generated. Using all generated.")
-            n_candidates = all_generated_pt.shape[0]
-        if n_candidates == 0:
-             continue
-
-        current_samples_pt = all_generated_pt[:n_candidates]
-        # Convert needed tensors to PIL for evaluation
-        current_samples_pil = base_pipeline.image_processor.postprocess(
-                current_samples_pt, output_type="pil", do_denormalize=[True] * n_candidates # Diffusers standard is denormalize
-        )
-        # Store for potential reuse
-        all_base_samples_pil[n_candidates] = current_samples_pil
-        all_base_samples_pt[n_candidates] = current_samples_pt
-
-        # NFE calculation for base generation
-        nfe = config.sampling.num_inference_steps * n_candidates
-
-        # Select final population for evaluation/saving grid
-        if config.sampling.population_size < n_candidates:
-            # Uniform random sampling from the N candidates
-            indices = torch.randperm(n_candidates)[:config.sampling.population_size]
-            eval_samples_pil = [current_samples_pil[i] for i in indices]
-            save_samples_pt = current_samples_pt[indices]
-        else:
-            eval_samples_pil = current_samples_pil
-            save_samples_pt = current_samples_pt
-
-        # Evaluate metrics on the selected population
-        metrics = evaluate_images(eval_samples_pil, prompt, config)
-        metrics['NFEs'] = nfe # Assign NFE for generating N candidates
-        metrics_data[n_candidates] = metrics
-
-        # Save image grid of the evaluated population
-        grid_dir = Path(config.paths.image_dir) / "bon"
-        grid_dir.mkdir(parents=True, exist_ok=True)
-        grid_path = grid_dir / f"bon_N{n_candidates}_{prompt[:30].replace(' ', '_')}.png"
-        try:
-            save_samples_pt_norm = (save_samples_pt / 2 + 0.5).clamp(0, 1)
-            save_image(save_samples_pt_norm.cpu(), grid_path, nrow=int(math.ceil(np.sqrt(len(eval_samples_pil)))))
-            logger.debug(f"Saved BON image grid to {grid_path}")
-        except Exception as e:
-            logger.error(f"Failed to save BON image grid: {e}")
-
-    return metrics_data, all_base_samples_pil, all_base_samples_pt
+def run_bon(config, prompt, reward_name, pipeline):
+    """Best-of-N: N = NFE // T prior samples (prefixes of one generated set for smaller budgets);
+    the single sample with the highest guiding reward is returned."""
+    metrics_data = {}
+    num_steps = config.sampling.num_inference_steps
+    n_list = [max(1, nfe // num_steps) for nfe in config.sampling.compute_budget]
+    gen_batch_size = config.eval.eval_batch_size
+    reset_peak_memory()
+    images, rewards, gen_time = [], [], 0.0
+    for nfe, n_candidates in zip(config.sampling.compute_budget, n_list):
+        t0 = time.time()
+        while len(images) < n_candidates:
+            b = min(gen_batch_size, n_candidates - len(images))
+            out = pipeline(prompt=[prompt] * b, negative_prompt=[config.dataset.negative_prompt] * b,
+                           num_inference_steps=num_steps, guidance_scale=config.sampling.guidance_scale,
+                           eta=config.sampling.eta, output_type="pil").images
+            images.extend(out)
+            rewards.extend(get_reward_function(reward_name=reward_name, images=out, prompts=[prompt] * b))
+        gen_time += time.time() - t0
+        best = int(np.argmax(rewards[:n_candidates]))
+        metrics = evaluate_images([images[best]], prompt, config)
+        metrics.update({'NFEs': nfe, 'ActualNFEs': n_candidates * num_steps, 'ActualParticles': n_candidates,
+                        'Time': gen_time, 'RewardEvals': n_candidates, 'PeakMemMB': peak_memory_mb()})
+        finish_nfe_point([images[best]], metrics, "BoN", prompt, reward_name, nfe, config)
+        metrics_data[nfe] = metrics
+    return metrics_data
 
 
 @torch.no_grad()
 def run_fkd(config, prompt, reward_name, pipeline):
-    """Run FKD-guided Stable Diffusion generation."""
+    """FK steering (SMC). Each NFE point is a separate run with K = NFE // T particles; the
+    population_size evaluation images are drawn with replacement by the final importance weights."""
     metrics_data = {}
-    # Setup memory logging
     method_name = "FKD-R" if config.fkd.use_rollout else "FKD"
-    log_file_prefix = Path(config.paths.metrics_dir) / f"gpu_memory_{method_name}.txt"
-    log_file_prefix.parent.mkdir(parents=True, exist_ok=True)
-
-    # Create output directory for FKD images
-    dir_name = "fkd-r" if config.fkd.use_rollout else "fkd"
-    output_dir_fkd_images = Path(config.paths.image_dir) / reward_name / dir_name
-    output_dir_fkd_images.mkdir(parents=True, exist_ok=True)
-
-    reward_fn_fkd = lambda images_pil: get_reward_function(
-        reward_name=reward_name,
-        images=images_pil,
-        prompts=[prompt] * len(images_pil),
-    )
-
     fkd_args = {
         "use_smc": True,
         "potential_type": config.fkd.potential_type,
@@ -430,54 +346,16 @@ def run_fkd(config, prompt, reward_name, pipeline):
         "use_rollout": config.fkd.use_rollout,
         "batch_size": config.fkd.batch_size,
     }
-
-    # Determine max particle count and run FKD once
+    nfe_per_particle = config.sampling.num_inference_steps
     if config.fkd.use_rollout:
-        nfe_per_particle = config.sampling.num_inference_steps      # for main denoising loop
         for t in range(config.fkd.resampling_t_start, config.fkd.resampling_t_end + 1, config.fkd.resample_frequency):
-            nfe_per_particle += config.sampling.num_inference_steps - t     # for rollouts
-    else:
-        nfe_per_particle = config.sampling.num_inference_steps
-    eval_particles =  sorted(list(set([max(1, nfe // nfe_per_particle) for nfe in config.sampling.compute_budget])))
-    max_n_particles = max(eval_particles)
+            nfe_per_particle += config.sampling.num_inference_steps - t
 
-    # # Process in batches to handle large particle counts
-    # all_sampled_images = []
-    # for batch_start in tqdm.tqdm(range(0, max_n_particles, config.fkd.batch_size), 
-    #                       desc="Generating FKD samples",
-    #                       disable=not config.common.use_progress_bar):
-    #     batch_size = min(config.fkd.batch_size, max_n_particles - batch_start)
-    #     # logger.info(f"Processing generation batch {batch_start//config.fkd.batch_size + 1}/{(max_n_particles + config.fkd.batch_size - 1)//config.fkd.batch_size} " +
-    #     #       f"(particles {batch_start+1}-{batch_start+batch_size}/{max_n_particles})")
-        
-    #     # Run generation with FKD steering
-    #     batch_fkd_args = fkd_args.copy()
-    #     batch_fkd_args["num_particles"] = batch_size
-
-    #     output = pipeline(
-    #         prompt=[prompt] * batch_size,
-    #         negative_prompt=[config.dataset.negative_prompt] * batch_size,
-    #         fkd_args=batch_fkd_args,
-    #         num_inference_steps=config.sampling.num_inference_steps,
-    #         guidance_scale=config.sampling.guidance_scale,
-    #         eta=config.sampling.eta,
-    #         output_type="pil",
-    #     ).images
-
-    #     all_sampled_images.extend(output)
-    
-    # Evaluate for each target NFE level by subsetting
-    for i, n_particles in enumerate(eval_particles):
-        # Reset memory stats for this particle count
-        if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats()
-        logger.info(f"FKD Particle Count {n_particles}")
-
-        # Timing the sampling phase
-        start_time = time.time()
-
-        # Call the new sample_batched_smc method
-        current_samples = pipeline.sample_batched_smc(
+    for nfe_target in config.sampling.compute_budget:
+        n_particles = max(1, nfe_target // nfe_per_particle)
+        reset_peak_memory()
+        t0 = time.time()
+        out = pipeline.sample_batched_smc(
             num_particles=n_particles,
             prompt=[prompt] * n_particles,
             processing_batch_size=config.fkd.batch_size,
@@ -487,51 +365,18 @@ def run_fkd(config, prompt, reward_name, pipeline):
             guidance_scale=config.sampling.guidance_scale,
             eta=config.sampling.eta,
             output_type="pil",
-        ).images
-
-        # Log sampling time for FKD
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        elapsed = time.time() - start_time
-        with open(log_file_prefix, 'a') as f:
-            f.write(f"{method_name} Particles {n_particles}: sampling time {elapsed:.4f}s\n")
-
-        # Log memory usage after this particle count
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-            curr = torch.cuda.memory_allocated()
-            peak = torch.cuda.max_memory_allocated()
-            with open(log_file_prefix, 'a') as f:
-                f.write(f"{method_name} Particles {n_particles}: current {curr/1024**2:.2f}MB, peak {peak/1024**2:.2f}MB\n")
-
-
-        logger.info(f"Evaluating FKD for N = {n_particles} particles")
-
-        # if config.sampling.population_size < len(current_samples):
-        #     indices = np.random.choice(len(current_samples), size=config.sampling.population_size)
-        #     eval_images = [current_samples[i] for i in indices]
-        # else:
-        #     eval_images = current_samples
-        num_to_resample = min(config.sampling.population_size, len(current_samples))
-        # Get indices of top num_to_resample samples based on rewards
-        rewards = np.array(reward_fn_fkd(current_samples))
-        top_indices = np.argsort(rewards)[-num_to_resample:]
-        eval_images = [current_samples[i] for i in top_indices]
-            
-        # Evaluate metrics
+        )
+        if torch.cuda.is_available(): torch.cuda.synchronize()
+        elapsed = time.time() - t0
+        w = torch.softmax(out.log_weights.double(), dim=0)
+        idx = torch.multinomial(w, config.sampling.population_size, replacement=True).tolist()
+        eval_images = [out.images[i] for i in idx]
         metrics = evaluate_images(eval_images, prompt, config)
-        metrics['NFEs'] = config.sampling.compute_budget[i]
-        metrics_data[config.sampling.compute_budget[i]] = metrics
-
-        # Save image grid
-        grid_path = output_dir_fkd_images / f"{prompt.replace(' ', '_')}_{config.sampling.compute_budget[i]}.png"
-        rows = int(math.ceil(np.sqrt(len(eval_images))))
-        cols = int(math.ceil(len(eval_images) / rows))
-        image_grid = make_image_grid(eval_images, rows=rows, cols=cols)
-        image_grid.save(grid_path)
-
-    if not config.common.use_progress_bar:
-         dlogging.set_verbosity_warning()
+        metrics.update({'NFEs': nfe_target, 'ActualNFEs': out.nfes, 'ActualParticles': n_particles,
+                        'FinalWeightESS': float(1.0 / (w.pow(2).sum() * n_particles)),
+                        'Time': elapsed, 'RewardEvals': pipeline.reward_evals, 'PeakMemMB': peak_memory_mb()})
+        finish_nfe_point(eval_images, metrics, method_name, prompt, reward_name, nfe_target, config)
+        metrics_data[nfe_target] = metrics
 
     return metrics_data
 
@@ -575,10 +420,11 @@ def aggregate_and_save_summary_sd(all_run_metrics_dfs, reward_name, output_dir):
 
 
 def load_pipeline(config, method):
+    # no safety checker: all methods decode latents without it, so Best-of-N must not either
     if method == 'FKD' or method == 'FKD-R':
-        pipeline = FKDStableDiffusion.from_pretrained(config.model.sd_model_id)
+        pipeline = FKDStableDiffusion.from_pretrained(config.model.sd_model_id, safety_checker=None, requires_safety_checker=False)
     else:
-        pipeline = StableDiffusionPipeline.from_pretrained(config.model.sd_model_id)
+        pipeline = StableDiffusionPipeline.from_pretrained(config.model.sd_model_id, safety_checker=None, requires_safety_checker=False)
     
     pipeline.scheduler = DDIMScheduler.from_config(pipeline.scheduler.config)
     pipeline.scheduler.set_timesteps(
@@ -588,6 +434,10 @@ def load_pipeline(config, method):
     pipeline.set_progress_bar_config(disable=True)
     if not config.common.use_progress_bar:
         dlogging.set_verbosity_error()
+
+    if config.no_compile:
+        logger.info(f"[{config.common.device}] TensorRT compilation disabled (--no_compile).")
+        return pipeline
 
     logger.info(f"[{config.common.device}] Attempting to compile UNet...")
     sys.stdout.flush()
@@ -653,7 +503,7 @@ def worker_process(gpu_id, config, prompt_subset):
     if hasattr(config, 'mcts_rollout') and config.mcts_rollout: enabled_methods.append("MCTS-R")
     if config.fkd.enabled: enabled_methods.append("FKD")
     if hasattr(config, 'fkd_rollout') and config.fkd_rollout: enabled_methods.append("FKD-R")
-    if config.bon.enabled: enabled_methods.append("BoN")
+    if config.bon_enabled: enabled_methods.append("BoN")
 
     for method in enabled_methods:
         # Reset GPU memory stats before running each method

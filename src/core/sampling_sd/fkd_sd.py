@@ -3,10 +3,19 @@ Feynman-Kac Diffusion (FKD) steering mechanism implementation.
 """
 
 import torch
+from dataclasses import dataclass
 from enum import Enum
 import numpy as np
 from typing import Callable, Optional, Tuple
 import logging
+
+
+@dataclass
+class SDSMCOutput:
+    images: list                # final images (PIL with output_type="pil")
+    log_weights: torch.Tensor   # [K] final log importance weights
+    final_rewards: torch.Tensor # [K] guiding reward of the final images
+    nfes: int
 
 
 class PotentialType(Enum):
@@ -199,6 +208,7 @@ import inspect
 from typing import Any, Callable, Dict, List, Optional, Union
 
 from src.core.rewards import get_reward_function
+from src.core.smc_weights import SMCWeights
 
 import torch
 from packaging import version
@@ -1192,13 +1202,25 @@ class FKDStableDiffusion(
             )
             return torch.tensor(rewards).to(x.device)
 
-        fkd_steerer = FKD(
-            latent_to_decode_fn=lambda x: latent_to_decode(
-                model=self, output_type=output_type, latents=x
-            ),
-            reward_fn=postprocess_and_apply_reward_fn,
-            **fkd_args
-        )
+        reward_batch_size = fkd_args.get("batch_size", processing_batch_size)
+
+        def batched_reward(x0_latents):
+            out = []
+            for b in range(0, x0_latents.shape[0], reward_batch_size):
+                decoded = latent_to_decode(model=self, output_type=output_type, latents=x0_latents[b:b + reward_batch_size])
+                out.append(postprocess_and_apply_reward_fn(decoded).float())
+            self.reward_evals += x0_latents.shape[0]
+            return torch.cat(out)
+
+        if PotentialType(fkd_args.get("potential_type", "diff")) != PotentialType.DIFF:
+            raise NotImplementedError("Only the 'diff' potential is implemented with persistent importance weights.")
+        schedule = list(range(fkd_args["resampling_t_start"], fkd_args["resampling_t_end"] + 1, fkd_args["resample_frequency"]))
+        weights = SMCWeights(num_particles, lmbda=fkd_args["lmbda"], adaptive_resampling=fkd_args["adaptive_resampling"],
+                             resampling_schedule=schedule, device=device,
+                             reward_min_value=fkd_args.get("reward_min_value", 0.0))
+        use_rollout = fkd_args.get("use_rollout", False)
+        self.nfes = 0
+        self.reward_evals = 0
 
         # Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
@@ -1255,6 +1277,7 @@ class FKDStableDiffusion(
                             )
                     
                     population_noise_pred[batch_start_idx:batch_end_idx] = noise_pred_batch
+                    self.nfes += batch_end_idx - batch_start_idx   # one CFG pair = 1 NFE
 
                 # Scheduler step for the whole population
                 step_dict = self.scheduler.step(
@@ -1263,13 +1286,9 @@ class FKDStableDiffusion(
                 prev_latents = step_dict["prev_sample"]
                 current_x0_preds = step_dict["pred_original_sample"] # x0_preds for all particles [N, C, H, W]
 
-                # FKD Resampling
-                # SMC is always used, so fkd_steerer is always available.
-                should_resample_fkd = fkd_steerer.is_potential_resampling_step(sampling_idx=i)
-                
-                if should_resample_fkd:
+                if i in schedule:
                     x0_for_reward_calculation: torch.Tensor
-                    if fkd_steerer.use_rollout:
+                    if use_rollout:
                         logger.info(f"Performing batched rollouts for resampling at step {i} (t={t.item()})...")
                         # _perform_batched_rollout needs prompt_embeds_population and other relevant args
                         x0_for_reward_calculation = self._perform_batched_rollout(
@@ -1288,17 +1307,13 @@ class FKDStableDiffusion(
                             use_progress_bar=use_rollout_progress_bar,
                         )
                         logger.info(f"Batched rollouts complete for step {i}.")
+                        self.nfes += num_particles * (len(timesteps) - i)
                     else:
                         x0_for_reward_calculation = current_x0_preds
-                    
-                    # latents are x_t, fkd.resample takes x_t
-                    # It will use its latent_to_decode_fn on x0_for_reward_calculation
-                    resampled_latents = fkd_steerer.resample(
-                        sampling_idx=i,
-                        latents=prev_latents, # Resample based on where particles *would* land
-                        x0_preds_for_reward=x0_for_reward_calculation
-                    )
-                    latents = resampled_latents
+
+                    # the potential is evaluated at x_t; the pair (x_t, x_{t-1}) is resampled
+                    indices = weights.potential_step(i, batched_reward(x0_for_reward_calculation))
+                    latents = prev_latents[indices] if indices is not None else prev_latents
                 else:
                     latents = prev_latents
 
@@ -1339,12 +1354,14 @@ class FKDStableDiffusion(
 
         image = self.image_processor.postprocess(image, output_type=output_type, do_denormalize=do_denormalize)
 
+        # terminal potential lambda * (r(x_0) - r~_last) on the final images
+        final_rewards = torch.tensor(get_reward_function(fkd_args["guidance_reward_fn"], images=list(image),
+                                                         prompts=[prompt_list[0]] * len(image)), device=device).float()
+        weights.final_step(final_rewards)
+        self.reward_evals += len(image)
+
         self.maybe_free_model_hooks()
-
-        if not return_dict:
-            return (image, has_nsfw_concept)
-
-        return StableDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept)
+        return SDSMCOutput(images=image, log_weights=weights.log_w, final_rewards=final_rewards, nfes=self.nfes)
 
 
 # FK Steering Change

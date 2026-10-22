@@ -1,0 +1,315 @@
+{
+ "prompts": [
+  "a photo of a blue tie and a pink dining table",
+  "a photo of an orange traffic light and a white toilet",
+  "a photo of a purple computer keyboard and a blue scissors",
+  "a photo of a purple parking meter and a red laptop",
+  "a photo of an orange tv",
+  "a photo of a black teddy bear",
+  "a photo of a white sheep",
+  "a photo of four broccolis",
+  "a photo of three books",
+  "a photo of three pizzas",
+  "a photo of a toilet left of a kite",
+  "a photo of a truck left of a baseball bat",
+  "a photo of a hair drier below an elephant",
+  "a photo of a bicycle above a parking meter",
+  "a photo of a car",
+  "a photo of a tv",
+  "a photo of a snowboard",
+  "a photo of a tv and a cell phone",
+  "a photo of a wine glass and a bear",
+  "a photo of a toothbrush and a toilet"
+ ],
+ "metadata": [
+  {
+   "tag": "color_attr",
+   "include": [
+    {
+     "class": "tie",
+     "count": 1,
+     "color": "blue"
+    },
+    {
+     "class": "dining table",
+     "count": 1,
+     "color": "pink"
+    }
+   ],
+   "prompt": "a photo of a blue tie and a pink dining table"
+  },
+  {
+   "tag": "color_attr",
+   "include": [
+    {
+     "class": "traffic light",
+     "count": 1,
+     "color": "orange"
+    },
+    {
+     "class": "toilet",
+     "count": 1,
+     "color": "white"
+    }
+   ],
+   "prompt": "a photo of an orange traffic light and a white toilet"
+  },
+  {
+   "tag": "color_attr",
+   "include": [
+    {
+     "class": "computer keyboard",
+     "count": 1,
+     "color": "purple"
+    },
+    {
+     "class": "scissors",
+     "count": 1,
+     "color": "blue"
+    }
+   ],
+   "prompt": "a photo of a purple computer keyboard and a blue scissors"
+  },
+  {
+   "tag": "color_attr",
+   "include": [
+    {
+     "class": "parking meter",
+     "count": 1,
+     "color": "purple"
+    },
+    {
+     "class": "laptop",
+     "count": 1,
+     "color": "red"
+    }
+   ],
+   "prompt": "a photo of a purple parking meter and a red laptop"
+  },
+  {
+   "tag": "colors",
+   "include": [
+    {
+     "class": "tv",
+     "count": 1,
+     "color": "orange"
+    }
+   ],
+   "prompt": "a photo of an orange tv"
+  },
+  {
+   "tag": "colors",
+   "include": [
+    {
+     "class": "teddy bear",
+     "count": 1,
+     "color": "black"
+    }
+   ],
+   "prompt": "a photo of a black teddy bear"
+  },
+  {
+   "tag": "colors",
+   "include": [
+    {
+     "class": "sheep",
+     "count": 1,
+     "color": "white"
+    }
+   ],
+   "prompt": "a photo of a white sheep"
+  },
+  {
+   "tag": "counting",
+   "include": [
+    {
+     "class": "broccoli",
+     "count": 4
+    }
+   ],
+   "exclude": [
+    {
+     "class": "broccoli",
+     "count": 5
+    }
+   ],
+   "prompt": "a photo of four broccolis"
+  },
+  {
+   "tag": "counting",
+   "include": [
+    {
+     "class": "book",
+     "count": 3
+    }
+   ],
+   "exclude": [
+    {
+     "class": "book",
+     "count": 4
+    }
+   ],
+   "prompt": "a photo of three books"
+  },
+  {
+   "tag": "counting",
+   "include": [
+    {
+     "class": "pizza",
+     "count": 3
+    }
+   ],
+   "exclude": [
+    {
+     "class": "pizza",
+     "count": 4
+    }
+   ],
+   "prompt": "a photo of three pizzas"
+  },
+  {
+   "tag": "position",
+   "include": [
+    {
+     "class": "kite",
+     "count": 1
+    },
+    {
+     "class": "toilet",
+     "count": 1,
+     "position": [
+      "left of",
+      0
+     ]
+    }
+   ],
+   "prompt": "a photo of a toilet left of a kite"
+  },
+  {
+   "tag": "position",
+   "include": [
+    {
+     "class": "baseball bat",
+     "count": 1
+    },
+    {
+     "class": "truck",
+     "count": 1,
+     "position": [
+      "left of",
+      0
+     ]
+    }
+   ],
+   "prompt": "a photo of a truck left of a baseball bat"
+  },
+  {
+   "tag": "position",
+   "include": [
+    {
+     "class": "elephant",
+     "count": 1
+    },
+    {
+     "class": "hair drier",
+     "count": 1,
+     "position": [
+      "below",
+      0
+     ]
+    }
+   ],
+   "prompt": "a photo of a hair drier below an elephant"
+  },
+  {
+   "tag": "position",
+   "include": [
+    {
+     "class": "parking meter",
+     "count": 1
+    },
+    {
+     "class": "bicycle",
+     "count": 1,
+     "position": [
+      "above",
+      0
+     ]
+    }
+   ],
+   "prompt": "a photo of a bicycle above a parking meter"
+  },
+  {
+   "tag": "single_object",
+   "include": [
+    {
+     "class": "car",
+     "count": 1
+    }
+   ],
+   "prompt": "a photo of a car"
+  },
+  {
+   "tag": "single_object",
+   "include": [
+    {
+     "class": "tv",
+     "count": 1
+    }
+   ],
+   "prompt": "a photo of a tv"
+  },
+  {
+   "tag": "single_object",
+   "include": [
+    {
+     "class": "snowboard",
+     "count": 1
+    }
+   ],
+   "prompt": "a photo of a snowboard"
+  },
+  {
+   "tag": "two_object",
+   "include": [
+    {
+     "class": "tv",
+     "count": 1
+    },
+    {
+     "class": "cell phone",
+     "count": 1
+    }
+   ],
+   "prompt": "a photo of a tv and a cell phone"
+  },
+  {
+   "tag": "two_object",
+   "include": [
+    {
+     "class": "wine glass",
+     "count": 1
+    },
+    {
+     "class": "bear",
+     "count": 1
+    }
+   ],
+   "prompt": "a photo of a wine glass and a bear"
+  },
+  {
+   "tag": "two_object",
+   "include": [
+    {
+     "class": "toothbrush",
+     "count": 1
+    },
+    {
+     "class": "toilet",
+     "count": 1
+    }
+   ],
+   "prompt": "a photo of a toothbrush and a toilet"
+  }
+ ]
+}

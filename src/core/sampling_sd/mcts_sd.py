@@ -171,7 +171,8 @@ class MCTSStableDiffusionSampler:
                  height: int = 512,
                  width: int = 512,
                  output_dir: str = None,
-                 visualization_timesteps: List[int] = None):
+                 visualization_timesteps: List[int] = None,
+                 pw_alpha_root: Optional[float] = None):
         """
         Args:
           reward_fn: Function that takes decoded images and returns scalar rewards
@@ -216,6 +217,9 @@ class MCTSStableDiffusionSampler:
         self.width = width
         self.output_dir = output_dir
         self.visualization_timesteps = visualization_timesteps
+        # meta-root widening exponent with rollouts; the hard-coded value is 0.4, the authors use
+        # 0.8 for their T2I runs (issue #2)
+        self.pw_alpha_root = pw_alpha_root
         
         # These will be set up in setup_diffusion
         self.prompt_embeds = None
@@ -586,6 +590,19 @@ class MCTSStableDiffusionSampler:
             return step_output.prev_sample, step_output.pred_original_sample
         
     
+    def _finalize_terminal(self, node):
+        """Last denoising step at index 0 (1 NFE), so terminal nodes hold the same final latent as
+        the FK / Best-of-N pipelines."""
+        if getattr(node, 'is_final', False):
+            return
+        node.x_t, _ = self.p_sample(node.x_t, 0)
+        node.is_final = True
+
+    def _terminal_value(self, node):
+        self._finalize_terminal(node)
+        images = self.decode_latents(node.x_t, output_type="pil")
+        node.update_value(np.exp(self.reward_fn(images)))
+
     def ddim_denoise(self, x_t, t, prompt_embeds=None):
         """
         Deterministically denoise x_t to x_0 using DDIM scheduler from diffusers.
@@ -700,7 +717,7 @@ class MCTSStableDiffusionSampler:
         if self._is_meta_root(node):
             effective_visits = max(1, node.visit_count)
             if self.use_rollout:
-                meta_root_alpha = 0.4
+                meta_root_alpha = self.pw_alpha_root if self.pw_alpha_root is not None else 0.4
                 progressive_width_const = 2
             else:
                 alpha_min = 0.3
@@ -922,18 +939,14 @@ class MCTSStableDiffusionSampler:
                         # If we've reached t=0, evaluate reward and do backup
                         if next_node.t <= 0:
                             # Decode latents and compute reward
-                            images = self.decode_latents(next_node.x_t, output_type="pil")
-                            r_value = np.exp(self.reward_fn(images))
-                            next_node.update_value(r_value)
+                            self._terminal_value(next_node)
                             self._backup(next_node)
 
             # 4. Process terminal nodes (if any nodes reached t=0)
             for node in terminal_nodes:
                 if node.visit_count == 1:  # Only evaluate if first visit
                     # Decode latents and compute reward
-                    images = self.decode_latents(node.x_t, output_type="pil")
-                    r_value = np.exp(self.reward_fn(images))
-                    node.update_value(r_value)
+                    self._terminal_value(node)
                     self._backup(node)
                     nodes_to_remove.add(id(node))
             
@@ -963,9 +976,7 @@ class MCTSStableDiffusionSampler:
             if node.t <= 0: # Ensure it is indeed terminal
                 # Assume reward calculation and backup should happen if it's a fresh terminal state.
                 # This function is called after creating a child, so this child is new.
-                images = self.decode_latents(node.x_t, output_type="pil")
-                r_value = np.exp(self.reward_fn(images))
-                node.update_value(r_value)
+                self._terminal_value(node)
                 self._backup(node)
             else: # Should not happen based on above separation
                 del finalized_sim_paths[path_idx]
@@ -982,9 +993,7 @@ class MCTSStableDiffusionSampler:
                 if t <= 0: # Should have been caught or already terminal
                     for path_idx, node in sim_path_node_list:
                         if path_idx not in finalized_sim_paths: # If not already processed
-                            images = self.decode_latents(node.x_t, output_type="pil")
-                            r_value = np.exp(self.reward_fn(images))
-                            node.update_value(r_value)
+                            self._terminal_value(node)
                             self._backup(node)
                             finalized_sim_paths[path_idx] = node
                     continue
@@ -1007,9 +1016,7 @@ class MCTSStableDiffusionSampler:
                         parent_node_in_rollout.noise_pred = noise_pred_batch[i:i+1]
                     
                     if next_node_in_rollout.t <= 0:
-                        images = self.decode_latents(next_node_in_rollout.x_t, output_type="pil")
-                        r_value = np.exp(self.reward_fn(images))
-                        next_node_in_rollout.update_value(r_value)
+                        self._terminal_value(next_node_in_rollout)
                         self._backup(next_node_in_rollout)
                         finalized_sim_paths[path_idx] = next_node_in_rollout
                     else:
@@ -1147,9 +1154,7 @@ class MCTSStableDiffusionSampler:
                         parent_leaf_node.noise_pred = noise_pred_batch[i:i+1]
 
                     if one_step_child.t <= 0: # Reached terminal by this single step
-                        images = self.decode_latents(one_step_child.x_t, output_type="pil")
-                        r_value = np.exp(self.reward_fn(images))
-                        one_step_child.update_value(r_value)
+                        self._terminal_value(one_step_child)
                         self._backup(one_step_child)
                         # next_path_nodes_update already has this terminal node for path_idx
 
@@ -1341,7 +1346,7 @@ class MCTSStableDiffusionSampler:
                     pbar.update(self.nfes - pbar.n)
                 else:
                     pbar.update(num_nfes - pbar.n)
-            elif (self.nfes + 1) % (num_nfes // 10) == 0:
+            elif (self.nfes + 1) % max(1, num_nfes // 10) == 0:
                 progress = (self.nfes + 1) / num_nfes * 100
                 print(f"Tree building progress: {progress:.1f}% (NFE {self.nfes+1}/{num_nfes})")
                 sys.stdout.flush()  # Ensure progress is visible in logs
