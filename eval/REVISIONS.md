@@ -1,0 +1,4 @@
+# eval/ revisions
+
+- `eval_cifar.py`: FID with 2048-d Inception-v3 pool features against the class's 1000 CIFAR-10 test images without augmentation; CMMD on CLIP ViT-L/14 (224 px, `openai/clip-vit-large-patch14`) embeddings with the reference kernel (sigma 10, x1000, biased estimator), where the CMMD paper uses the 336 px model; held-out accuracy with `ahsanjavid/convnext-tiny-finetuned-cifar10`; CLIP diversity as mean sqrt(2(1-cos)) over 10^4 random pairs. The metrics computed inside `run_img.py` (768-d Inception FID against augmented training images, RBF MMD with sigma 10, Inception cosine diversity) are kept for comparison with the paper.
+- `eval_sd.py`: ImageReward mean and max, HPSv2.1 mean, LAION aesthetic mean, CLIP pairwise diversity (repository definition), LPIPS-alex pairwise diversity, distinct-image count, per method, prompt and NFE.
