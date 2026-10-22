@@ -8,7 +8,8 @@ A configuration whose samples are non-finite or whose SMC population diverges on
 ineligible (SW = inf). `collapsed` counts seeds whose mode-mass TV exceeds 0.5. Every run_2d call is one method and one
 configuration; results stay in the run_2d output tree, and summary.json / summary.md are written
 to <base_dir>/toy/<--name>/. `--chains` restricts the calibration to some method chains (DAS
-inherits the TDS scale, so TDS and DAS form one chain); `--tds_scales` replaces the TDS scale grid.
+inherits the TDS scale, so TDS and DAS form one chain); `--tds_scales` replaces the TDS scale grid;
+`--dts_fixed_eps` fixes the DTS epsilon, so the DTS chain calibrates only alpha.
 """
 import argparse
 import json
@@ -125,6 +126,9 @@ def calibrate_dim(runner, dim, results):
         final['DAS'] = schedule_stage('DAS', {'scale': tds_scale, 'gamma': gamma})
 
     def dts():
+        if runner.args.dts_fixed_eps is not None:
+            final['DTS'] = runner.stage(dim, 'DTS', {'eps': runner.args.dts_fixed_eps}, 'alpha', DTS_ALPHAS, results)
+            return
         alpha = runner.stage(dim, 'DTS', {}, 'alpha', DTS_ALPHAS, results)[0]['params']['alpha']
         final['DTS'] = runner.stage(dim, 'DTS', {'alpha': alpha}, 'eps', DTS_EPS, results)
 
@@ -170,6 +174,7 @@ def main():
     ap.add_argument('--chains', nargs='+', choices=['FK', 'DPS-RG', 'TDS-DAS', 'DTS'],
                     default=['FK', 'DPS-RG', 'TDS-DAS', 'DTS'])
     ap.add_argument('--tds_scales', nargs='+', type=float, default=SCALES)
+    ap.add_argument('--dts_fixed_eps', type=float)
     ap.add_argument('--name', default='m1_calibration', help='output directory under <base_dir>/toy/')
     ap.add_argument('--run_prefix', default='calib', help='prefix of the run_2d exp_name of each run')
     args = ap.parse_args()
