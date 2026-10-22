@@ -135,9 +135,9 @@ def train_classifier(model, config, patience=20, epochs=100, device='cpu'):
         model.train()
         train_loss = 0
         train_acc = 0
-        for i, (x, y) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch} Train")):
-            x = x.to(device)
-            y = y.to(device).flatten()
+        for i, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch} Train")):
+            x = batch[config.dataset.x_tensor].to(device)
+            y = batch[config.dataset.y_tensor].to(device).flatten()
 
             logits = model(x)
             loss = F.cross_entropy(logits, y)
@@ -157,9 +157,9 @@ def train_classifier(model, config, patience=20, epochs=100, device='cpu'):
         if validate:
             model.eval()
             with torch.no_grad():
-                for i, (x, y) in enumerate(tqdm(valid_loader, desc=f"Epoch {epoch} Valid")):
-                    x = x.to(device)
-                    y = y.to(device).flatten()
+                for i, batch in enumerate(tqdm(valid_loader, desc=f"Epoch {epoch} Valid")):
+                    x = batch[config.dataset.x_tensor].to(device)
+                    y = batch[config.dataset.y_tensor].to(device).flatten()
 
                     logits = model(x)
                     loss = F.cross_entropy(logits, y)

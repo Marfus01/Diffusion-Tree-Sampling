@@ -19,17 +19,41 @@ class ScaleTransform:
             tensor = tensor.float() / 255.0
         return (tensor * 2) - 1
 
+class _DictDataset(torch.utils.data.Dataset):
+    """Wraps a torchvision dataset so that batches are dicts {x_tensor: images, y_tensor: labels},
+    the layout consumed by the run scripts, the classifier training and the metrics."""
+
+    def __init__(self, base, indices, x_key, y_key):
+        self.base = base
+        self.indices = indices
+        self.x_key = x_key
+        self.y_key = y_key
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, i):
+        x, y = self.base[self.indices[i]]
+        return {self.x_key: x, self.y_key: torch.tensor(y, dtype=torch.long)}
+
+
 def get_img_dataset(
     config,
     splits=None,
     filter_labels=None,
+    augment=True,
 ):
-    """Loads/downloads dataset and returns dataloaders."""
-    import deeplake
-    data = {}
+    """Returns dataloaders over the torchvision copy of MNIST / CIFAR-10 in config.dataset.data_path.
 
-    # Use attributes from config
-    dataset_name = config.dataset.name
+    Keys: '<split>_loader' for each split and, with filter_labels, '<split>_class_loader'
+    restricted to those labels. Images are in [-1, 1]. With augment=True CIFAR-10 images get
+    the original pipeline's resize-crop-flip augmentation (used for classifier training and
+    the code's own FID); augment=False gives the unmodified images.
+    """
+    import torchvision
+
+    data = {}
+    dataset_name = config.dataset.name.lower()
     data_path = config.dataset.data_path
     batch_size = config.dataset.batch_size
     image_size = config.dataset.image_size
@@ -38,126 +62,36 @@ def get_img_dataset(
     y_tensor = config.dataset.y_tensor
     splits = config.dataset.splits if splits is None else splits
 
-    if dataset_name.lower() not in ['mnist', 'cifar10', 'imagenet']:
+    if dataset_name not in ['mnist', 'cifar10']:
         raise ValueError(f"Dataset {dataset_name} is not supported.")
-
-    dt_id = dataset_name.lower()
 
     tfs = []
     if image_size is not None:
-        # tfs += [transforms.ToPILImage()] # PIL conversion happens in decode_method
         tfs += [transforms.Resize((image_size, image_size))]
-
-        # Apply CIFAR10 augmentations if specified (or add config flag?)
-        if 'cifar10' in dataset_name.lower():
+        if dataset_name == 'cifar10' and augment:
             tfs += [transforms.Resize((int(image_size * 1.12), int(image_size * 1.12))),
                     transforms.RandomCrop(image_size),
                     transforms.RandomHorizontalFlip()]
-    tfs += [transforms.ToTensor(),
-            ScaleTransform()]
+    tfs += [transforms.ToTensor(), ScaleTransform()]
     transform_composition = transforms.Compose(tfs)
 
-    if splits is None:
-        splits = ['train']
-        dataset_id = dt_id
-    else:
-        dataset_id = None
-
+    dataset_cls = torchvision.datasets.CIFAR10 if dataset_name == 'cifar10' else torchvision.datasets.MNIST
     for split in splits:
-        if dataset_id is None:
-            dataset_id = f"{dt_id}-{split}"
-
-        # Construct the full path for the local dataset split
-        full_local_path = Path(data_path) / dataset_id
-
-        try:
-            # Attempt to load directly from the constructed local path
-            local_ds = deeplake.load(
-                str(full_local_path),
-                read_only=True,
-                verbose=False,
-            )
-            logger.info(f"Successfully loaded local dataset: {full_local_path}")
-
-        except Exception as e:
-            logger.info(f"Local dataset not found at {full_local_path} or error loading: {e}")
-            logger.info(f"Attempting to load from hub: hub://activeloop/{dataset_id} and copy locally.")
-
-            # Load remotely
-            remote_ds = deeplake.load(
-                f"hub://activeloop/{dataset_id}",
-                verbose=False,
-            )
-
-            # Copy the entire dataset locally
-            logger.info(f"Copying remote dataset to local path: {full_local_path}...")
-            deeplake.copy(remote_ds, str(full_local_path), overwrite=True)
-            logger.info(f"Dataset copied successfully.")
-
-            # Now load the newly created local copy
-            local_ds = deeplake.load(
-                str(full_local_path),
-                read_only=True,
-                verbose=False,
-            )
-            logger.info(f"Successfully loaded newly copied local dataset: {full_local_path}")
-
-        data[f'{split}_data'] = local_ds
-
-        # Filter based on labels if filter_labels is provided
+        base = dataset_cls(root=data_path, train=(split == 'train'), download=False, transform=transform_composition)
+        targets = np.asarray(base.targets)
+        all_indices = np.arange(len(base))
+        data[f'{split}_data'] = base
+        data[f'{split}_loader'] = torch.utils.data.DataLoader(
+            _DictDataset(base, all_indices, x_tensor, y_tensor),
+            batch_size=batch_size, shuffle=True, num_workers=workers)
         if filter_labels is not None:
             if isinstance(filter_labels, int):
                 filter_labels = [filter_labels]
-            elif not isinstance(filter_labels, (list, tuple)):
-                raise TypeError("filter_labels must be an integer, list, or tuple.")
-
-            try:
-                # Define the filter function
-                def deeplake_filter_fn(sample):
-                    label_value = sample[y_tensor].numpy(fetch_chunks=False)
-                    if isinstance(label_value, (list, np.ndarray)) and len(label_value) > 0:
-                        label_value = label_value[0]
-                    return label_value in filter_labels
-
-                # Create a filtered view
-                class_view = local_ds.filter(deeplake_filter_fn, scheduler='threaded')
-                num_filtered_samples = len(class_view)
-
-                if num_filtered_samples > 0:
-                    # Create PyTorch loader for the filtered view
-                    data[f'{split}_class_loader'] = class_view.pytorch(
-                        batch_size=batch_size,
-                        num_workers=workers,
-                        transform={
-                            x_tensor: transform_composition,
-                            y_tensor: None,
-                        },
-                        shuffle=True,
-                        decode_method={'images': 'pil'},
-                    )
-                    logger.info(f"Filtered DataLoader for {split} (classes {filter_labels}) created with {len(data[f'{split}_class_loader'])} batches.")
-                else:
-                    logger.info(f"Warning: Filtering resulted in 0 samples for {y_tensor}:{filter_labels} in {split}. No class-specific loader created.")
-                    data[f'{split}_class_loader'] = None
-
-            except Exception as e:
-                logger.info(f"Error during filtering for classes {filter_labels} in {split}: {e}")
-                logger.info("Proceeding without class-specific loader for this split.")
-                data[f'{split}_class_loader'] = None
-
-        # Create the main loader from the full dataset
-        data[f'{split}_loader'] = local_ds.pytorch(
-            batch_size=batch_size,
-            num_workers=workers,
-            transform={
-                x_tensor: transform_composition,
-                y_tensor: None,
-                },
-            shuffle=True,
-            decode_method={'images': 'pil'},
-        )
-        logger.info(f"Successfully created PyTorch DataLoader for {split}")
-        dataset_id = None
+            class_indices = all_indices[np.isin(targets, list(filter_labels))]
+            data[f'{split}_class_loader'] = torch.utils.data.DataLoader(
+                _DictDataset(base, class_indices, x_tensor, y_tensor),
+                batch_size=batch_size, shuffle=True, num_workers=workers) if len(class_indices) else None
+        logger.info(f"Loaded {dataset_name} {split}: {len(base)} images from {data_path}")
 
     return data
 
