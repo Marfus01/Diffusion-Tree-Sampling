@@ -6,11 +6,14 @@
 #SBATCH -o logs/%x_%j.out
 #SBATCH -e logs/%x_%j.err
 # A-R005: analytic GMM, d_x in {8, 80}, problem instances 1-3 (instance 0 is the calibration
-# unit), seed 0, 1e4-1e6 NFE, with the configurations frozen in calibration.md. One
-# single-threaded run_2d process per (d_x, instance, method) on the job's CPU cores.
+# unit), sampler seeds $SEEDS (default 0), 1e4-1e6 NFE, with the configurations frozen in
+# calibration.md. One single-threaded run_2d process per (d_x, instance, method, seed) on the
+# job's CPU cores; the per-seed sample_metrics_*.csv are the results (all_runs_raw_summary.csv is
+# rewritten by whichever seed of a directory finishes last).
 set -euo pipefail
 source $HOME/run/dts/Diffusion-Tree-Sampling/jobs/stageA/env.sh
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 CUDA_VISIBLE_DEVICES=""
+SEEDS=${SEEDS:-0}
 
 declare -A CFG
 CFG[8,DTS]="--do_mcts_rollout --pw_alpha 0.8 --pw_alpha_root 0.8"
@@ -30,10 +33,12 @@ CMDS=logs/A-M1-grid_${SLURM_JOB_ID}/commands.txt
 for m in DTS FK DPS-RG TDS DAS; do          # longest (DTS) first for load balance
   for d in 8 80; do
     for i in 1 2 3; do
-      echo "python -m scripts.run_2d --dataset gmm --gmm_dim $d --gmm_instance $i --seed 0 --num_seeds 1 \
+      for s in $SEEDS; do
+        echo "python -m scripts.run_2d --dataset gmm --gmm_dim $d --gmm_instance $i --seed $s --num_seeds 1 \
 --compute_budget 10000 30000 100000 300000 1000000 --device cpu --no_progress_bar --base_dir $DTS_BASE_DIR \
---exp_name m1_grid_${m} ${CFG[$d,$m]} > logs/A-M1-grid_${SLURM_JOB_ID}/d${d}_i${i}_${m}.log 2>&1 \
-|| echo FAILED d${d}_i${i}_${m}" >> $CMDS
+--exp_name m1_grid_${m} ${CFG[$d,$m]} > logs/A-M1-grid_${SLURM_JOB_ID}/d${d}_i${i}_${m}_s${s}.log 2>&1 \
+|| echo FAILED d${d}_i${i}_${m}_s${s}" >> $CMDS
+      done
     done
   done
 done
