@@ -6,7 +6,7 @@
 #SBATCH -o logs/%x_%j.out
 #SBATCH -e logs/%x_%j.err
 # A-R005: analytic GMM, d_x in {8, 80}, problem instances 1-3 (instance 0 is the calibration
-# unit), sampler seeds $SEEDS (default 0), 1e4-1e6 NFE, with the configurations frozen in
+# unit), methods $METHODS (default all), sampler seeds $SEEDS (default 0), 1e4-1e6 NFE, with the configurations frozen in
 # calibration.md. One single-threaded run_2d process per (d_x, instance, method, seed) on the
 # job's CPU cores; the per-seed sample_metrics_*.csv are the results (all_runs_raw_summary.csv is
 # rewritten by whichever seed of a directory finishes last).
@@ -14,14 +14,17 @@ set -euo pipefail
 source $HOME/run/dts/Diffusion-Tree-Sampling/jobs/stageA/env.sh
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 CUDA_VISIBLE_DEVICES=""
 SEEDS=${SEEDS:-0}
+METHODS=${METHODS:-DTS DTS-eps1 FK DPS-RG TDS DAS}
 
 declare -A CFG
 CFG[8,DTS]="--do_mcts_rollout --pw_alpha 0.8 --pw_alpha_root 0.8"
+CFG[8,DTS-eps1]="--do_mcts_rollout --eps_explore 1.0 --pw_alpha 0.8 --pw_alpha_root 0.8"
 CFG[8,FK]="--do_smc --resampling_steps 20 80 20 --adaptive_resampling false"
 CFG[8,DPS-RG]="--do_guidance --guidance_scale 2.0"
 CFG[8,TDS]="--do_smc_guidance --guidance_scale 0.25 --resampling_steps 20 80 20 --adaptive_resampling false"
 CFG[8,DAS]="--do_smc_guidance_tempering --guidance_scale 0.25 --das_gamma 0.00703 --resampling_steps 20 80 20 --adaptive_resampling true"
 CFG[80,DTS]="--do_mcts_rollout"
+CFG[80,DTS-eps1]="--do_mcts_rollout --eps_explore 1.0 --pw_alpha 0.5 --pw_alpha_root 0.5"
 CFG[80,FK]="--do_smc --resampling_steps 20 80 20 --adaptive_resampling true"
 CFG[80,DPS-RG]="--do_guidance --guidance_scale 0.25"
 CFG[80,TDS]="--do_smc_guidance --guidance_scale 0.25 --resampling_steps 20 80 20 --adaptive_resampling true"
@@ -30,7 +33,7 @@ CFG[80,DAS]="--do_smc_guidance_tempering --guidance_scale 0.25 --das_gamma 0.008
 mkdir -p logs/A-M1-grid_${SLURM_JOB_ID}
 CMDS=logs/A-M1-grid_${SLURM_JOB_ID}/commands.txt
 : > $CMDS
-for m in DTS FK DPS-RG TDS DAS; do          # longest (DTS) first for load balance
+for m in $METHODS; do                       # DTS first in the default order for load balance
   for d in 8 80; do
     for i in 1 2 3; do
       for s in $SEEDS; do
