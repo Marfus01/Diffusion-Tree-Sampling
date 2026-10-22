@@ -448,11 +448,14 @@ def main():
         if problem is not None:
             q0 = problem.sample_prior(config.sampling.population_size, seed=20_000 + seed)
             extra['discretization_SW'] = sliced_wasserstein(prior_samples.cpu().numpy(), q0, n_projections=args.sw_projections)
+            # same-size Monte-Carlo floor of discretization_SW: two exact prior draws
+            extra['prior_split_SW'] = sliced_wasserstein(problem.sample_prior(config.sampling.population_size, seed=40_000 + seed),
+                                                         q0, n_projections=args.sw_projections)
             target_split = problem.sample_target(config.sampling.population_size, seed=30_000 + seed)
             extra['target_split_SW'] = sliced_wasserstein(target_split, task.gt_samples, n_projections=args.sw_projections)
             extra['gmm'] = {'dim': problem.dim, 'instance': args.gmm_instance, 'sigma_y': problem.sigma_y,
                             'y': problem.y.tolist(), 'posterior_weights': problem.posterior_weights.tolist()}
-            logger.info(f"SW(p_theta,0, q_0) = {extra['discretization_SW']:.4f}; "
+            logger.info(f"SW(p_theta,0, q_0) = {extra['discretization_SW']:.4f} (two exact q_0 draws: {extra['prior_split_SW']:.4f}); "
                         f"SW between two exact target draws = {extra['target_split_SW']:.4f}")
         write_run_meta(config.paths.run_dir, config, args, extra=extra, name=f"run_meta_seed{seed}.json")
 
