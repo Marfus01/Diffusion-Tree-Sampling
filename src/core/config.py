@@ -406,6 +406,8 @@ def _process_path_setup(config, class_name=None):
             run_name_prefix = f"{run_name_prefix}_{config.common.exp_name}"
         # run_dir_final = task_results_base / f"{run_name_prefix}_{timestamp}"
         run_dir_final = task_results_base / f"{run_name_prefix}"
+    elif config.common.exp_name:
+        run_dir_final = task_results_base / config.common.exp_name
 
     # Create Run Subdirectories
     run_dir_final.mkdir(parents=True, exist_ok=True)
