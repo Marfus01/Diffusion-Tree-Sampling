@@ -75,10 +75,12 @@ class Runner:
             return row
         df = pd.read_csv(csv)
         diverged = int(df['Diverged'].fillna(0).sum()) if 'Diverged' in df else 0
-        row.update(SW=float('inf') if diverged else float(df['SW'].mean()),
-                   SW_std=float(df['SW'].std()) if len(df) > 1 else None,
-                   ModeTV=float(df['ModeTV'].mean()) if 'ModeTV' in df else None,
-                   diverged_seeds=diverged)
+        if diverged or 'SW' not in df:
+            # a configuration that diverges on any seed is not eligible
+            row.update(SW=float('inf'), SW_std=None, ModeTV=None, diverged_seeds=diverged)
+            return row
+        row.update(SW=float(df['SW'].mean()), SW_std=float(df['SW'].std()) if len(df) > 1 else None,
+                   ModeTV=float(df['ModeTV'].mean()), diverged_seeds=0)
         return row
 
     def stage(self, dim, method, base, key, values, results):
