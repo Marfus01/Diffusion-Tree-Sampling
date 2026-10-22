@@ -3,7 +3,9 @@
 Each method's parameters are fixed one at a time (the others at the code defaults) by the mean
 SW over `--num_seeds` seeds at `--nfe`; a scale that wins at the edge of its grid is extended by
 one step. The best and runner-up configuration of each method's last stage are re-run at
-`--recheck_nfe` (seed 0) to confirm the ranking. Every run_2d call is one method and one
+`--recheck_nfe` over `--recheck_seeds` seeds, and the one with the lower mean SW there is chosen.
+A configuration whose samples are non-finite or whose SMC population diverges on any seed is
+ineligible (SW = inf). `collapsed` counts seeds whose mode-mass TV exceeds 0.5. Every run_2d call is one method and one
 configuration; results stay in the run_2d output tree, and summary.json / summary.md are written
 to <base_dir>/toy/m1_calibration/.
 """
@@ -15,6 +17,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 SCHEDULES = {'branch': (20, 80, 20), 'every': (0, 99, 1)}
@@ -71,16 +74,16 @@ class Runner:
                / name / 'metrics' / 'all_runs_raw_summary.csv')
         row = {'dim': dim, 'method': method, 'params': params, 'run': name, 'returncode': rc}
         if rc != 0 or not csv.exists():
-            row.update(SW=float('inf'), SW_std=None, ModeTV=None, diverged_seeds=None)
+            row.update(SW=float('inf'), SW_std=None, ModeTV=None, collapsed=None, diverged_seeds=None)
             return row
         df = pd.read_csv(csv)
         diverged = int(df['Diverged'].fillna(0).sum()) if 'Diverged' in df else 0
-        if diverged or 'SW' not in df:
-            # a configuration that diverges on any seed is not eligible
-            row.update(SW=float('inf'), SW_std=None, ModeTV=None, diverged_seeds=diverged)
+        if diverged or 'SW' not in df or not np.isfinite(df['SW']).all():
+            row.update(SW=float('inf'), SW_std=None, ModeTV=None, collapsed=None,
+                       diverged_seeds=max(diverged, int((~np.isfinite(df['SW'])).sum()) if 'SW' in df else len(df)))
             return row
         row.update(SW=float(df['SW'].mean()), SW_std=float(df['SW'].std()) if len(df) > 1 else None,
-                   ModeTV=float(df['ModeTV'].mean()), diverged_seeds=0)
+                   ModeTV=float(df['ModeTV'].mean()), collapsed=int((df['ModeTV'] > 0.5).sum()), diverged_seeds=0)
         return row
 
     def stage(self, dim, method, base, key, values, results):
@@ -133,12 +136,21 @@ def write_summary(out_dir, results, rechecks, chosen):
     out_dir.mkdir(parents=True, exist_ok=True)
     with open(out_dir / 'summary.json', 'w') as f:
         json.dump({'calibration': results, 'recheck': rechecks, 'chosen': chosen}, f, indent=2, default=str)
-    lines = ['| d_x | method | params | SW (mean) | SW std | ModeTV | diverged seeds |', '|---|---|---|---|---|---|---|']
+    fmt = lambda v: '' if v is None else (f"{v:.4g}" if isinstance(v, float) else str(v))
+    lines = ['| d_x | method | params | SW (mean) | SW std | ModeTV | collapsed seeds | diverged seeds |',
+             '|---|---|---|---|---|---|---|---|']
     for r in sorted(results, key=lambda r: (r['dim'], r['method'], r['SW'])):
-        lines.append(f"| {r['dim']} | {r['method']} | {r['params']} | {r['SW']:.4g} | {r['SW_std']} | {r['ModeTV']} | {r['diverged_seeds']} |")
-    lines += ['', '| d_x | method | rank at calibration NFE | params | SW at recheck NFE |', '|---|---|---|---|---|']
+        lines.append(f"| {r['dim']} | {r['method']} | {r['params']} | {fmt(r['SW'])} | {fmt(r['SW_std'])} | "
+                     f"{fmt(r['ModeTV'])} | {fmt(r.get('collapsed'))} | {fmt(r['diverged_seeds'])} |")
+    lines += ['', '| d_x | method | rank at calibration NFE | params | SW at recheck NFE (mean) | SW std | collapsed seeds |',
+              '|---|---|---|---|---|---|---|']
     for r in rechecks:
-        lines.append(f"| {r['dim']} | {r['method']} | {r['rank']} | {r['params']} | {r['SW']:.4g} |")
+        lines.append(f"| {r['dim']} | {r['method']} | {r['rank']} | {r['params']} | {fmt(r['SW'])} | "
+                     f"{fmt(r['SW_std'])} | {fmt(r.get('collapsed'))} |")
+    lines += ['', '| d_x | method | chosen |', '|---|---|---|']
+    for d, ms in chosen.items():
+        for m, params in ms.items():
+            lines.append(f"| {d} | {m} | {params} |")
     (out_dir / 'summary.md').write_text('\n'.join(lines) + '\n')
 
 
@@ -149,6 +161,7 @@ def main():
     ap.add_argument('--nfe', type=int, default=10_000)
     ap.add_argument('--num_seeds', type=int, default=3)
     ap.add_argument('--recheck_nfe', type=int, default=1_000_000)
+    ap.add_argument('--recheck_seeds', type=int, default=3)
     ap.add_argument('--workers', type=int, default=os.cpu_count())
     ap.add_argument('--base_dir', default=os.environ.get('DTS_BASE_DIR'))
     args = ap.parse_args()
@@ -159,18 +172,22 @@ def main():
     with ThreadPoolExecutor(max_workers=len(args.dims)) as dims:
         futures = {d: dims.submit(calibrate_dim, runner, d, results) for d in args.dims}
         finals = {d: f.result() for d, f in futures.items()}
-    chosen = {d: {m: rows[0]['params'] for m, rows in fin.items()} for d, fin in finals.items()}
-    write_summary(out_dir, results, [], chosen)
+    write_summary(out_dir, results, [], {})
 
     recheck_futures = []
     for d, fin in finals.items():
         for m, rows in fin.items():
             for rank, r in enumerate(rows[:2], start=1):
-                recheck_futures.append((d, m, rank, r['params'], runner.submit(d, m, r['params'], args.recheck_nfe, 1)))
+                recheck_futures.append((d, m, rank, r['params'],
+                                        runner.submit(d, m, r['params'], args.recheck_nfe, args.recheck_seeds)))
     rechecks = []
     for d, m, rank, params, f in recheck_futures:
         row = f.result()
-        rechecks.append({'dim': d, 'method': m, 'rank': rank, 'params': params, 'SW': row['SW'], 'run': row['run']})
+        rechecks.append({'dim': d, 'method': m, 'rank': rank, 'params': params, 'SW': row['SW'],
+                         'SW_std': row['SW_std'], 'collapsed': row.get('collapsed'), 'run': row['run']})
+    chosen = {}
+    for r in sorted(rechecks, key=lambda r: r['SW'], reverse=True):
+        chosen.setdefault(r['dim'], {})[r['method']] = r['params']   # lowest recheck SW written last
     write_summary(out_dir, results, rechecks, chosen)
     print(f"summary: {out_dir / 'summary.md'}")
 
