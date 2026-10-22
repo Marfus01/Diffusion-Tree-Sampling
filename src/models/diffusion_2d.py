@@ -12,6 +12,7 @@ import os
 import sys
 import time
 from src.utils.datasets import get_2d_dataset, DATASETS
+from src.core.config import get_default_toy_config, process_toy_config
 
 # Import the new plot utilities
 from src.utils.plotting_utils import (
@@ -219,7 +220,8 @@ class DiffusionModel:
             
     #         return x_t_prev
 
-    def p_sample(self, x_t, t, eta=1.0, guidance_grad=None, guidance_scale=1.0, return_log_prob=False, use_smc=False):
+    def p_sample(self, x_t, t, eta=1.0, guidance_grad=None, guidance_scale=1.0, return_log_prob=False, use_smc=False,
+                 noise_pred=None):
         """
         Single step of reverse diffusion process using DDIM sampling.
 
@@ -227,9 +229,13 @@ class DiffusionModel:
             x_t (torch.Tensor): The noisy input tensor at timestep t.
             t (Union[int, torch.Tensor]): The current timestep index (or indices).
             eta (float): Controls the stochasticity of the sampling (0 = DDIM, 1 = DDPM-like).
+            noise_pred (torch.Tensor, optional): noise prediction at (x_t, t) already computed by the
+                caller (e.g. inside the guidance gradient); the network is then not called again.
 
         Returns:
-            torch.Tensor: The denoised tensor at timestep t-1.
+            torch.Tensor: The denoised tensor at timestep t-1. With return_log_prob, also the
+            log-densities of x_{t-1} under the base kernel and under the guided proposal; both are
+            0 for the deterministic step t=0 (zero posterior variance).
         """
         self.noise_predictor.eval()
 
@@ -242,7 +248,10 @@ class DiffusionModel:
             t = t.expand(x_t.shape[0])
 
         with torch.no_grad():
-            predicted_noise = self.noise_predictor(x_t, t.float() / self.n_timesteps)
+            if noise_pred is None:
+                predicted_noise = self.noise_predictor(x_t, t.float() / self.n_timesteps)
+            else:
+                predicted_noise = noise_pred.detach()
 
             alpha_cumprod_t_prev = self.extract(self.alphas_cumprod_prev, t, x_t.shape) # Handles t=0 correctly
 
@@ -288,11 +297,16 @@ class DiffusionModel:
                 x_t_prev = x_t_prev + posterior_variance_t * guidance_scale * guidance_grad
 
             if return_log_prob:
-                log_prob_diffusion = -0.5 * (x_t_prev - pred_prev_sample_mean).pow(2) / posterior_variance_t - torch.log(std_dev_t) - torch.log(torch.sqrt(2 * torch.as_tensor(math.pi)))
-                log_prob_diffusion = log_prob_diffusion.sum(dim=-1)
+                var = torch.broadcast_to(std_dev_t ** 2, x_t_prev.shape)
+                stochastic = var > 0
+                safe_var = torch.where(stochastic, var, torch.ones_like(var))
+                log_norm = -0.5 * torch.log(2 * math.pi * safe_var)
+                log_prob_diffusion = -0.5 * (x_t_prev - pred_prev_sample_mean).pow(2) / safe_var + log_norm
+                log_prob_diffusion = torch.where(stochastic, log_prob_diffusion, torch.zeros_like(log_prob_diffusion)).sum(dim=-1)
                 if guidance_grad is not None:
-                    log_prob_proposal = -0.5 * (x_t_prev - pred_prev_sample_mean - posterior_variance_t * guidance_scale * guidance_grad).pow(2) / posterior_variance_t - torch.log(std_dev_t) - torch.log(torch.sqrt(2 * torch.as_tensor(math.pi)))
-                    log_prob_proposal = log_prob_proposal.sum(dim=-1)
+                    shift = posterior_variance_t * guidance_scale * guidance_grad
+                    log_prob_proposal = -0.5 * (x_t_prev - pred_prev_sample_mean - shift).pow(2) / safe_var + log_norm
+                    log_prob_proposal = torch.where(stochastic, log_prob_proposal, torch.zeros_like(log_prob_proposal)).sum(dim=-1)
                 else:
                     log_prob_proposal = log_prob_diffusion
                 return x_t_prev, log_prob_diffusion, log_prob_proposal, predicted_noise
@@ -603,10 +617,6 @@ def main():
     # Device configuration
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # Create directories for checkpoints and plots
-    os.makedirs('checkpoints', exist_ok=True)
-    os.makedirs('plots', exist_ok=True)
-
     # Hyperparameters
     batch_size = 256  # Increased from 128 for faster training
     n_epochs = 5000   # Reduced from 10000 to speed up training
@@ -619,16 +629,25 @@ def main():
     parser.add_argument('--dataset', type=str, default='gaussian_mixture', 
                         choices=list(DATASETS.keys()),
                         help='Dataset to use for training/testing')
+    parser.add_argument('--epochs', type=int, default=n_epochs, help='Training epochs (cosine LR schedule spans all epochs).')
+    parser.add_argument('--base_dir', type=str, default=None, help='Experiment root; the checkpoint is written to <base_dir>/toy/checkpoints/<dataset>/.')
     parser.add_argument('--plot-reward', action='store_true', help='Plot the reward function heatmap')
     parser.add_argument('--no-progress-bar', action='store_true', help='Disable tqdm progress bars and use simple progress messages')
     args = parser.parse_args()
     
     dataset_name = args.dataset
+    n_epochs = args.epochs
     use_progress_bar = not args.no_progress_bar
     print(f"Using dataset: {dataset_name}")
+
+    config = get_default_toy_config()
+    config.dataset.name = dataset_name
+    if args.base_dir is not None:
+        config.common.base_dir = args.base_dir
+    config = process_toy_config(config)
     
     # 1. Get the dataset from datasets.py
-    dataset_obj = get_2d_dataset(dataset_name, device='cpu')
+    dataset_obj = get_2d_dataset(config, dataset_name, device='cpu')
     dataset = dataset_obj.sample(n_samples=10000)
     dataloader = DataLoader(TensorDataset(dataset), batch_size=batch_size, shuffle=True, 
                             num_workers=4 if torch.cuda.is_available() else 0)
@@ -636,9 +655,10 @@ def main():
     # 2. Initialize the diffusion model
     model = DiffusionModel(input_dim=2, hidden_dim=128, n_timesteps=n_timesteps, 
                             beta_start=beta_start, beta_end=beta_end, lr=lr, device=device)
+    model.scheduler = optim.lr_scheduler.CosineAnnealingLR(model.optimizer, T_max=n_epochs, eta_min=1e-6)
     
     # Try to load the pre-trained model if available
-    checkpoint_dir = os.path.join('checkpoints', dataset_name)
+    checkpoint_dir = config.paths.checkpoint_dir
     model_path = os.path.join(checkpoint_dir, "diffusion_model.pt")
     
     # Check if the file exists before attempting to load it
@@ -649,11 +669,7 @@ def main():
         print(f"No pre-trained model found for {dataset_name}. Training a new model...")
         # Custom training loop to handle progress bar option
         
-        # Create dataset-specific folders
-        plots_dir = os.path.join('plots', dataset_name)
-        os.makedirs(checkpoint_dir, exist_ok=True)
-        os.makedirs(plots_dir, exist_ok=True)
-        
+        plots_dir = config.paths.plot_dir
         losses = []
         epoch_report_interval = max(1, n_epochs // 20)  # Report progress ~20 times
         
@@ -720,9 +736,7 @@ def main():
         plt.savefig(os.path.join(plots_dir, "training_loss.png"))
         plt.close()
     
-    # Create plots directory
-    plots_dir = os.path.join('plots', dataset_name)
-    os.makedirs(plots_dir, exist_ok=True)
+    plots_dir = config.paths.plot_dir
     
     # 3. Generate samples from the trained model using p_sample (DDPM) instead of ddim_sample
     print("Generating samples using DDPM (p_sample)...")
@@ -732,15 +746,13 @@ def main():
     
     # Configure the timestep iterator based on progress bar preference
     timesteps = range(model.n_timesteps - 1, -1, -1)
+    report_steps = max(1, model.n_timesteps // 10)
     if use_progress_bar:
         timesteps = tqdm.tqdm(timesteps)
-    else:
-        # Print progress at regular intervals
-        report_steps = max(1, model.n_timesteps // 10)  # Report ~10 times during sampling
-    
+
     # Step-by-step denoising
     for i, t in enumerate(timesteps):
-        x = model.p_sample(x, t)
+        x, _ = model.p_sample(x, t)
         
         # Print progress message at regular intervals if not using progress bar
         if not use_progress_bar and (i + 1) % report_steps == 0:
@@ -791,7 +803,8 @@ def main():
         noisy_samples, _ = model.q_sample(clean_samples, t)
         
         # Predict clean samples directly
-        predicted_clean = model.ddim_denoise(noisy_samples, t)
+        with torch.no_grad():
+            predicted_clean, _ = model.ddim_denoise(noisy_samples, t)
         
         noisy_samples_dict[t_val] = noisy_samples
         predicted_samples_dict[t_val] = predicted_clean
