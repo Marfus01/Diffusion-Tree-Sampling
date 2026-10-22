@@ -964,7 +964,7 @@ class MCTSDiffusionSampler:
                     pbar.update(self.nfes - pbar.n)
                 else:
                     pbar.update(num_nfes - pbar.n)
-            elif (self.nfes + 1) % (num_nfes // 10) == 0:
+            elif (self.nfes + 1) % max(1, num_nfes // 10) == 0:
                 progress = (self.nfes + 1) / num_nfes * 100
                 print(f"Tree building progress: {progress:.1f}% (NFE {self.nfes+1}/{num_nfes})")
                 sys.stdout.flush()

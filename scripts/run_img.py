@@ -7,6 +7,7 @@ import pandas as pd
 from pathlib import Path
 from torchvision.utils import save_image
 import math
+import time
 import logging
 import colorlog
 import pprint
@@ -23,6 +24,7 @@ from src.utils.datasets import get_img_dataset
 from src.models.classifier import get_train_classifier
 from src.models.diffusion_img import get_diffusion_model
 from src.core.config import get_default_image_config, process_image_config
+from src.utils.run_logging import RewardCounter, write_run_meta, reset_peak_memory, peak_memory_mb, distinct_count
 from src.evaluation.image_metrics import (
     compute_fid,
     compute_mmd,
@@ -71,6 +73,8 @@ def parse_script_args():
     cgroup.add_argument('--device', type=str, help='Override device.')
     cgroup.add_argument('--no_progress_bar', action='store_true', help='Override whether to use progress bar.')
     cgroup.add_argument('--hf_home', type=str, help='Override HuggingFace cache directory (HF_HOME).')
+    cgroup.add_argument('--base_dir', type=str, help='Experiment root (default $DTS_BASE_DIR or ~/mcts/experiments).')
+    cgroup.add_argument('--classifier_path', type=str, help='Guiding classifier checkpoint (trained and saved here if missing).')
 
     # --- Method Enabling ---
     mgroup = parser.add_argument_group('Method Selection')
@@ -89,6 +93,18 @@ def parse_script_args():
     sgroup.add_argument('--potential_type', type=str, help='Override potential type for FKD.')
     sgroup.add_argument('--lambda_param', type=float, help='Override temperature parameter for all methods.')
     sgroup.add_argument('--guidance_scale', type=float, default=1.0, help='Scale for reward-based guidance.')
+    sgroup.add_argument('--lambda', dest='reward_lambda', type=float, default=1.0,
+                        help='Inverse temperature of the target p e^{lambda r}: every method uses lambda * r.')
+    sgroup.add_argument('--das_gamma', type=float, default=0.008, help='DAS tempering rate gamma.')
+    sgroup.add_argument('--adaptive_resampling', type=lambda v: v.lower() in ('1', 'true', 'yes'),
+                        help='ESS-adaptive resampling for SMC/TDS/DAS (true/false).')
+    sgroup.add_argument('--pw_alpha', type=float, help='DTS progressive-widening alpha (default: hard-coded 0.8).')
+    sgroup.add_argument('--pw_alpha_root', type=float, help='DTS progressive-widening alpha of the meta-root only.')
+    sgroup.add_argument('--eps_explore', type=float, help='Constant epsilon for DTS tree construction (default 0).')
+    sgroup.add_argument('--mcts_batch_size', type=int, help='DTS internal batch size.')
+    sgroup.add_argument('--sibling_recompute', action='store_true',
+                        help='DTS: recompute the UNet (and charge 1 NFE) for every new child of an evaluated node, as in the original code.')
+    sgroup.add_argument('--no_save_samples', action='store_true', help='Do not save evaluation samples.')
 
     args = parser.parse_args()
     config = get_default_image_config()
@@ -100,13 +116,17 @@ def parse_script_args():
     if args.device is not None: config.common.device = args.device
     if args.no_progress_bar is not None: config.common.use_progress_bar = not args.no_progress_bar
     if args.hf_home is not None: config.common.hf_home = args.hf_home
+    if args.base_dir is not None: config.common.base_dir = args.base_dir
+    if args.classifier_path is not None: config.model.classifier_path = args.classifier_path
+    if args.adaptive_resampling is not None: config.fkd.adaptive_resampling = args.adaptive_resampling
+    if args.mcts_batch_size is not None: config.mcts.batch_size = args.mcts_batch_size
 
     # Enable methods based on specific flags
     if args.do_mcts: config.mcts.enabled = True
     if args.do_mcts_rollout: config.mcts_rollout = True # Using a temporary attribute
 
     if args.compute_budget is not None:
-        config.sampling.compute_budget = args.compute_budget
+        config.sampling.compute_budget = sorted(args.compute_budget)
     if args.population_size is not None: config.sampling.population_size = args.population_size
     if args.potential_type is not None: config.fkd.potential_type = args.potential_type
     if args.lambda_param is not None:
@@ -237,26 +257,40 @@ def save_results_to_csv(metrics_data, run_class_name, output_path, method_name, 
     return df
 
 
-@torch.no_grad()
-def run_mcts(config, run_class_name, target_class_list, classifier, 
-             inception_model, real_loader, pipeline, method_name="MCTS"):
-    """Run MCTS experiments."""
-    logger.info(f"--- Running MCTS for {run_class_name} ---")
-    metrics_data = {}
+def save_eval_samples(images, path):
+    """Saves evaluation images as uint8 [N, C, H, W] (the quantization of a saved PNG)."""
+    arr = ((images.clamp(-1, 1) / 2 + 0.5) * 255).round().to(torch.uint8).cpu().numpy()
+    np.savez_compressed(path, images=arr)
 
+
+def finish_nfe_point(images, metrics, method_name, run_class_name, target_nfes, output_dir, config, args):
+    metrics['Distinct'] = distinct_count(images)
+    if not args.no_save_samples:
+        save_eval_samples(images, Path(config.paths.metrics_dir) / f"samples_{method_name}_{run_class_name}_N{target_nfes}.npz")
+    grid = images[torch.randperm(images.shape[0])[:config.sampling.gen_batch_size]] if images.shape[0] > config.sampling.gen_batch_size else images
+    grid = (grid / 2 + 0.5).clamp(0, 1)
+    save_image(grid.cpu(), output_dir / f"{run_class_name}_{target_nfes}.png", nrow=int(math.ceil(np.sqrt(grid.shape[0]))))
+    logger.info(f"  {method_name} {run_class_name} NFE {target_nfes}: " +
+                ", ".join(f"{k}={v:.4g}" for k, v in metrics.items() if isinstance(v, (int, float, np.floating))))
+
+
+@torch.no_grad()
+def run_mcts(config, args, run_class_name, target_class_list, classifier,
+             inception_model, real_loader, pipeline, method_name="MCTS"):
+    """Runs MCTS or DTS (MCTS-Rollout); smaller NFE budgets are snapshots of one growing tree."""
+    logger.info(f"--- Running {method_name} for {run_class_name} ---")
+    metrics_data = {}
     use_rollout = "rollout" in method_name.lower()
 
-    reward_fn_mcts = lambda images: classifier_log_likelihood_reward(
-        images, target_class_list, classifier, config.common.device
-    ).detach().cpu().numpy()
+    reward = RewardCounter(lambda images: classifier_log_likelihood_reward(
+        images, target_class_list, classifier, config.common.device), scale=args.reward_lambda)
+    reward_fn_mcts = lambda images: reward(images).detach().cpu().numpy()
 
-    # Create output directories
     dir_name = "mcts-rollout" if use_rollout else "mcts"
     output_dir_mcts_images = Path(config.paths.image_dir) / dir_name
     output_dir_mcts_images.mkdir(parents=True, exist_ok=True)
-    # output_dir_mcts_metrics = Path(config.paths.metrics_dir) / "mcts"
-    # output_dir_mcts_metrics.mkdir(parents=True, exist_ok=True)
 
+    eps = args.eps_explore if args.eps_explore is not None else 0.0
     mcts_sampler = MCTSImageDiffusionSampler(
         pipeline=pipeline,
         reward_fn=reward_fn_mcts,
@@ -268,185 +302,116 @@ def run_mcts(config, run_class_name, target_class_list, classifier,
         exploration_const=config.mcts.exploration_const,
         progressive_width_const=config.mcts.progressive_width_const,
         progressive_width_alpha=config.mcts.progressive_width_alpha,
+        initial_exploration_prob=eps,
+        final_exploration_prob=eps,
         use_progress_bar=config.common.use_progress_bar,
         use_rollout=use_rollout,
         batch_size=config.mcts.batch_size,
         output_dir=str(output_dir_mcts_images),
         visualization_timesteps=list(config.mcts.expand_timesteps + [0]),
+        pw_alpha=args.pw_alpha,
+        pw_alpha_root=args.pw_alpha_root,
+        sibling_recompute=args.sibling_recompute,
     )
-
     mcts_sampler.initialize_root_nodes()
+    reset_peak_memory()
+    build_time = 0.0
 
-    # Run MCTS progressively for each target iteration count
-    for target_nfes in sorted(config.sampling.compute_budget):
-        logger.info(f"MCTS NFE {target_nfes} for {run_class_name}")
-
-        # Build search tree
+    for target_nfes in config.sampling.compute_budget:
+        t0 = time.time()
         mcts_sampler.build_search_tree(num_nfes=target_nfes)
+        build_time += time.time() - t0
+        build_reward_evals = reward.n_evals
+        t1 = time.time()
+        sampled_images, _ = mcts_sampler.sample_from_tree(population_size=config.sampling.population_size)
+        sample_time = time.time() - t1
 
-        # Sample images
-        sampled_images, _ = mcts_sampler.sample_from_tree(
-            population_size=config.sampling.population_size,
-        )
-
-        # Evaluate metrics
-        metrics = evaluate_images(
-            sampled_images,
-            real_loader,
-            target_class_list,
-            classifier,
-            inception_model,
-            config,
-        )
-        metrics['NFEs'] = target_nfes
-        metrics['ActualNFEs'] = mcts_sampler.nfes
+        metrics = evaluate_images(sampled_images, real_loader, target_class_list, classifier, inception_model, config)
+        metrics.update({'NFEs': target_nfes, 'ActualNFEs': mcts_sampler.nfes, 'BuildTime': build_time,
+                        'SampleTime': sample_time, 'Time': build_time + sample_time,
+                        'RewardEvals': build_reward_evals, 'PeakMemMB': peak_memory_mb()})
+        finish_nfe_point(sampled_images, metrics, method_name, run_class_name, target_nfes, output_dir_mcts_images, config, args)
         metrics_data[target_nfes] = metrics
-        logger.info(f"  NFE Target: {target_nfes} (using run with {config.sampling.population_size} particles, Actual NFEs: {mcts_sampler.nfes})")
-        logger.info(f"    FID: {metrics['FID']:.4f}, MMD: {metrics['MMD']:.4f}, LogProb: {metrics['LogProb_Mean']:.4f}")
-
-
-        if sampled_images.shape[0] > config.sampling.gen_batch_size:
-            sampled_images = sampled_images[torch.randperm(sampled_images.shape[0])[:config.sampling.gen_batch_size]]
-
-        # Save image grid
-        sampled_images_0_1 = (sampled_images / 2 + 0.5).clamp(0, 1)
-        grid_path = output_dir_mcts_images / f"{run_class_name}_{target_nfes}.png"
-        save_image(sampled_images_0_1.cpu(), grid_path, nrow=int(math.ceil(np.sqrt(sampled_images_0_1.shape[0]))))
-
-    # # Save results for this specific run class
-    # csv_path = output_dir_mcts_metrics / f"MCTS_{run_class_name}_metrics.csv"
-    # df = save_results_to_csv(metrics_data, csv_path, "MCTS", run_class_name, config)
 
     return metrics_data
 
 
 @torch.no_grad()
-def run_smc(config, run_class_name, target_class_list, classifier,
-            inception_model, real_loader, pipeline, method_name="SMC"): # Add method_name
-    """Run SMC, SMC-Guidance, SMC-Guidance-Tempering, or SMC-Rollout experiment."""
+def run_smc(config, args, run_class_name, target_class_list, classifier,
+            inception_model, real_loader, pipeline, method_name="SMC"):
+    """Runs SMC/FK, DPS-RG ('Guidance'), TDS ('SMC-Guidance'), DAS ('SMC-Guidance-Tempering') or
+    SMC-Rollout. Every NFE point is a separate run with K = NFE // (NFE per particle) particles;
+    SMC methods draw the population_size evaluation images with replacement by their final weights."""
     logger.info(f"--- Running {method_name} for {run_class_name} ---")
     metrics_data = {}
 
-    # Determine flags based on method_name
-    use_smc = "smc" in method_name.lower() # Base SMC functionality
+    use_smc = "smc" in method_name.lower()
     use_guidance = "guidance" in method_name.lower()
     use_tempering = "tempering" in method_name.lower()
     use_rollout = "rollout" in method_name.lower()
-    logger.info(f"  Config: use_smc={use_smc}, use_guidance={use_guidance}, use_tempering={use_tempering}, use_rollout={use_rollout}")
 
+    reward = RewardCounter(lambda images: classifier_log_likelihood_reward(
+        images, target_class_list, classifier, config.common.device).to(config.common.device), scale=args.reward_lambda)
 
-    # Reward function: Needs to return tensor for FKD/SMC internal use
-    reward_fn_smc = lambda images: classifier_log_likelihood_reward(
-        images, target_class_list, classifier, config.common.device
-    ).to(config.common.device)
-
-    # Create output directories (use method_name for folder)
-    output_dir_method = Path(config.paths.image_dir) / method_name.lower().replace('-','_')
+    output_dir_method = Path(config.paths.image_dir) / method_name.lower().replace('-', '_')
     output_dir_method.mkdir(parents=True, exist_ok=True)
 
-    # --- FKD/SMC Config Dictionary ---
     fkd_config_dict = {
-        'reward_fn': reward_fn_smc, # Use the tensor-returning function
-        'potential_type': config.fkd.potential_type, # Keep name 'fkd' in config for now
+        'potential_type': config.fkd.potential_type,
         'lmbda': config.fkd.lambda_param,
         'adaptive_resampling': config.fkd.adaptive_resampling,
         'resample_frequency': config.fkd.resample_frequency,
         'resampling_t_start': config.fkd.resampling_t_start,
         'resampling_t_end': config.fkd.resampling_t_end,
         'reward_min_value': config.fkd.reward_min_val,
-        # 'device' is handled by the pipeline
     }
-    
-    # --- Calculate NFEs per particle ---
-    resampling_schedule_indices = range(
-        config.fkd.resampling_t_start,
-        config.fkd.resampling_t_end + 1,
-        config.fkd.resample_frequency
-    ) if use_smc else []
 
-    nfe_per_particle = config.sampling.num_inference_steps
-    if use_guidance:
-        nfe_per_particle += config.sampling.num_inference_steps
-    if use_smc and use_rollout:
-        rollout_nfe_count = 0
-        for i in resampling_schedule_indices:
-            rollout_nfe_count += max(0, config.sampling.num_inference_steps - i)
-        nfe_per_particle += rollout_nfe_count
-        logger.info(f"Estimated additional NFEs per particle from rollout: {rollout_nfe_count}")
+    num_steps = config.sampling.num_inference_steps
+    nfe_per_particle = num_steps * (2 if use_guidance else 1)   # forward, plus backward with guidance
+    if use_smc and use_rollout and not use_guidance:
+        nfe_per_particle += sum(num_steps - i for i in range(config.fkd.resampling_t_start, config.fkd.resampling_t_end + 1, config.fkd.resample_frequency))
+    logger.info(f"NFEs per particle for {method_name}: {nfe_per_particle}")
+    n_eval = config.sampling.population_size
 
-    logger.info(f"Estimated NFEs per particle for {method_name}: {nfe_per_particle}")
-    if nfe_per_particle <= 0:
-        logger.warning(f"Calculated NFE per particle is {nfe_per_particle}. Setting to 1.")
-        nfe_per_particle = 1
-
-    # Determine particle counts required for each NFE target
-    eval_particles = sorted(list(set([max(1, nfe // nfe_per_particle) for nfe in config.sampling.compute_budget])))
-    logger.info(f"Will run with particle counts: {eval_particles}")
-    max_n_particles = max(eval_particles) if eval_particles else 1
-
-    all_smc_samples = {} # Store final samples per NFE target for eval/plotting
-
-    # Run SMC sampler once for each required particle count
-    for i, n_particles in enumerate(eval_particles):
-        logger.info(f"{method_name} Particle Count {n_particles} for {run_class_name}")
-
-        # Call the new sample_batched_smc method
-        current_samples = pipeline.sample_batched_smc(
+    for nfe_target in config.sampling.compute_budget:
+        n_particles = max(1, nfe_target // nfe_per_particle)
+        reward.reset()
+        reset_peak_memory()
+        t0 = time.time()
+        out = pipeline.sample_batched_smc(
             num_particles=n_particles,
             processing_batch_size=config.fkd.batch_size,
-            num_inference_steps=config.sampling.num_inference_steps,
+            num_inference_steps=num_steps,
             use_smc=use_smc,
             use_guidance=use_guidance,
             use_tempering=use_tempering,
             use_rollout=use_rollout,
             guidance_scale=config.guidance_scale,
-            reward_fn=reward_fn_smc,
+            reward_fn=reward,
             fkd_config=fkd_config_dict,
             device=config.common.device,
             eta=config.sampling.eta,
-            output_type="pt",
+            das_gamma=args.das_gamma,
             use_progress_bar=config.common.use_progress_bar,
-        ).images
-
-        actual_nfes_run = n_particles * nfe_per_particle # Estimate based on calculation
-
-        # Resample generated population if needed to match eval population size
-        if current_samples.shape[0] > config.sampling.population_size:
-             logger.info(f"Subsampling {current_samples.shape[0]} generated images to {config.sampling.population_size} for evaluation.")
-             indices = torch.randperm(current_samples.shape[0])[:config.sampling.population_size]
-             eval_samples = current_samples[indices]
-        elif current_samples.shape[0] < config.sampling.population_size:
-            logger.warning(f"Generated samples ({len(current_samples)}) < target population ({config.sampling.population_size}). Resampling with replacement.")
-            resample_indices = torch.randint(0, len(current_samples), (config.sampling.population_size,))
-            eval_samples = current_samples[resample_indices]
-        else:
-            eval_samples = current_samples
-
-        # Evaluate metrics
-        metrics = evaluate_images(
-            eval_samples,
-            real_loader,
-            target_class_list,
-            classifier,
-            inception_model,
-            config,
         )
-        nfe_target = config.sampling.compute_budget[i] # Corresponding NFE target
-        metrics['NFEs'] = nfe_target # Use target NFE for reporting
-        metrics['ActualNFEs'] = actual_nfes_run # Store estimated actual NFEs
-        metrics['ActualParticles'] = n_particles # Store particles used for this run
+        run_time = time.time() - t0
+        run_reward_evals = reward.n_evals
+        particles = out.images
+        if use_smc:
+            idx = torch.multinomial(torch.softmax(out.log_weights.double(), dim=0), n_eval, replacement=True)
+        elif n_particles >= n_eval:
+            idx = torch.randperm(n_particles, device=particles.device)[:n_eval]
+        else:
+            idx = torch.randint(0, n_particles, (n_eval,), device=particles.device)
+        eval_samples = particles[idx.to(particles.device)]
+        w = torch.softmax(out.log_weights.double(), dim=0)
+
+        metrics = evaluate_images(eval_samples, real_loader, target_class_list, classifier, inception_model, config)
+        metrics.update({'NFEs': nfe_target, 'ActualNFEs': out.nfes, 'ActualParticles': n_particles,
+                        'FinalWeightESS': float(1.0 / (w.pow(2).sum() * n_particles)),
+                        'Time': run_time, 'RewardEvals': run_reward_evals, 'PeakMemMB': peak_memory_mb()})
+        finish_nfe_point(eval_samples, metrics, method_name, run_class_name, nfe_target, output_dir_method, config, args)
         metrics_data[nfe_target] = metrics
-        logger.info(f"  NFE Target: {nfe_target} (using run with {n_particles} particles, Actual NFEs: {actual_nfes_run})")
-        logger.info(f"    FID: {metrics['FID']:.4f}, MMD: {metrics['MMD']:.4f}, LogProb: {metrics['LogProb_Mean']:.4f}")
-
-        # Save image grid (use the evaluated samples)
-        save_samples = eval_samples
-        if save_samples.shape[0] > config.sampling.gen_batch_size:
-            save_samples = save_samples[torch.randperm(save_samples.shape[0])[:config.sampling.gen_batch_size]]
-
-        eval_images_0_1 = (save_samples / 2 + 0.5).clamp(0, 1)
-        grid_path = output_dir_method / f"{run_class_name}_{nfe_target}.png"
-        save_image(eval_images_0_1.cpu(), grid_path, nrow=int(math.ceil(np.sqrt(eval_images_0_1.shape[0]))))
 
     return metrics_data
 
@@ -526,6 +491,7 @@ def main():
     logger.info("--- Final Configuration ---")
     logger.info("\n" + pprint.pformat(asdict(config)))
 
+    write_run_meta(config.paths.run_dir, config, args)
     logger.info("Loading shared resources...")
     classifier = get_train_classifier(config)
     logger.info(f"Loaded classifier from {config.paths.classifier_load_path}")
@@ -611,9 +577,10 @@ def main():
             # save_image(samples.cpu(), samples_grid_path, nrow=int(math.ceil(np.sqrt(config.sampling.gen_batch_size))))
             # logger.info(f"Saved generated image sample grid to {samples_grid_path}")
 
-            results_dict = run_fn(config, run_class_name, target_class, classifier,
+            results_dict = run_fn(config, args, run_class_name, target_class, classifier,
                                   inception_model, real_loader_run, pipeline, method_name=method)
-            df = save_results_to_csv(results_dict, run_class_name, None, method, config, save=False)
+            csv_path = Path(config.paths.metrics_dir) / f"{method}_{run_class_name}_metrics.csv"
+            df = save_results_to_csv(results_dict, run_class_name, csv_path, method, config, save=True)
             if df is not None:
                 all_run_metrics_dfs[method].append(df)
 

@@ -178,7 +178,10 @@ class MCTSImageDiffusionSampler:
                  exploration_type: str = 'epsilon',
                  batch_size: int = 4,
                  output_dir: str = None,
-                 visualization_timesteps: List[int] = None):
+                 visualization_timesteps: List[int] = None,
+                 pw_alpha: Optional[float] = None,
+                 pw_alpha_root: Optional[float] = None,
+                 sibling_recompute: bool = False):
         """
         Args:
           reward_fn: Function that takes images (Tensor[B, C, H, W]) and returns scalar rewards.
@@ -195,6 +198,16 @@ class MCTSImageDiffusionSampler:
           batch_size: Number of nodes to process in parallel per iteration.
           output_dir: Directory to save visualizations and results.
           visualization_timesteps: Timesteps to include in visualization.
+          pw_alpha / pw_alpha_root: progressive-widening exponents of expansion nodes / the
+            meta-root; None keeps the hard-coded values (0.8 with rollouts).
+          sibling_recompute: recompute the UNet for every new child of an already evaluated node
+            and charge 1 NFE (the original behaviour). By default a node's cached noise prediction
+            is reused for its later children and they cost 0 NFE, as in the 2D and SD samplers.
+
+        NFE accounting: one UNet forward per sample = 1; a reward gradient backpropagated through
+        the UNet = 1 more. Values are log M_hat (log-mean-exp backup). A node reaching t = 0 takes
+        the last denoising step (timestep 0 -> clean image, zero variance), so terminal nodes hold
+        the same final image as the SMC pipeline.
         """
         self.pipeline = pipeline
         self.device = device
@@ -219,6 +232,9 @@ class MCTSImageDiffusionSampler:
         self.batch_size = batch_size
         self.output_dir = output_dir
         self.visualization_timesteps = visualization_timesteps
+        self.pw_alpha = pw_alpha
+        self.pw_alpha_root = pw_alpha_root
+        self.sibling_recompute = sibling_recompute
         
         # These will be set up in setup_diffusion
         self.extra_step_kwargs = {}
@@ -353,8 +369,8 @@ class MCTSImageDiffusionSampler:
                 var = get_variance(self.pipeline.scheduler, t_var, prev_var)
                 var = ((eta**2) * _left_broadcast(var, prev_sample.shape)).to(self.device)
                 pred = prev_sample + self.guidance_scale * var * guidance_grad
-            # update count
-            self.nfes += batch_size
+            # forward + backward through the UNet
+            self.nfes += 2 * batch_size
             return pred.detach(), noise_pred.detach()
         else:
             # standard step without guidance
@@ -398,8 +414,27 @@ class MCTSImageDiffusionSampler:
         x_t_batch = torch.cat([node.x_t for node in nodes], dim=0)
         batch_size = x_t_batch.shape[0]
         timestep_tensor = torch.tensor([timestep], device=self.device)
+        cached = [node.noise_pred for node in nodes]
+        use_cache = (self.cache_noise_pred and not self.sibling_recompute and not self.use_guidance)
         # UNet and scheduler step
-        if self.use_guidance:
+        if use_cache:
+            with torch.no_grad():
+                missing = [i for i, c in enumerate(cached) if c is None]
+                if missing:
+                    # nodes repeated in `nodes` (several new children of one parent) need one forward
+                    uniq = {}
+                    for i in missing:
+                        uniq.setdefault(id(nodes[i]), i)
+                    first = list(uniq.values())
+                    out = self.pipeline.unet(torch.cat([nodes[i].x_t for i in first], dim=0), timestep_tensor).sample
+                    self.nfes += len(first)
+                    for j, i in enumerate(first):
+                        nodes[i].noise_pred = out[j:j+1]
+                noise_pred = torch.cat([node.noise_pred for node in nodes], dim=0)
+                step_output = self.pipeline.scheduler.step(noise_pred, timestep, x_t_batch, eta=eta)
+                x0_pred = step_output.pred_original_sample
+                pred_tm1 = step_output.prev_sample
+        elif self.use_guidance:
             with torch.enable_grad():
                 x_t_guided = x_t_batch.clone().detach().requires_grad_(True)
                 noise_pred = self.pipeline.unet(x_t_guided, timestep_tensor).sample
@@ -421,6 +456,7 @@ class MCTSImageDiffusionSampler:
                 var = get_variance(self.pipeline.scheduler, t_var, prev_var)
                 var = (eta**2 * _left_broadcast(var, prev_sample.shape)).to(self.device)
                 pred_tm1 = prev_sample + self.guidance_scale * var * guidance_grad
+            self.nfes += 2 * batch_size
         else:
             with torch.no_grad():
                 noise_pred = self.pipeline.unet(x_t_batch, timestep_tensor).sample
@@ -428,9 +464,8 @@ class MCTSImageDiffusionSampler:
                 prev_sample = step_output.prev_sample
                 x0_pred = step_output.pred_original_sample
                 pred_tm1 = prev_sample
-        # Update count and cache noise predictions
-        self.nfes += batch_size
-        if self.cache_noise_pred:
+            self.nfes += batch_size
+        if self.cache_noise_pred and not use_cache:
             for i, node in enumerate(nodes):
                 node.noise_pred = noise_pred[i:i+1]
         # Return either x_{t-1} or (x_{t-1}, x0)
@@ -445,6 +480,21 @@ class MCTSImageDiffusionSampler:
         Follows the same implementation as the pipeline.
         """
         return self.p_sample(x_t, t, predict_x0=True)
+
+    def _finalize_terminal(self, node):
+        """Last denoising step at index 0 (1 NFE): terminal nodes hold the final image."""
+        if getattr(node, 'is_final', False):
+            return
+        with torch.no_grad():
+            timestep = self.get_timestep_from_index(0)
+            noise_pred = self.pipeline.unet(node.x_t, torch.tensor([timestep], device=self.device)).sample
+            node.x_t = self.pipeline.scheduler.step(noise_pred, timestep, node.x_t, eta=self.eta).prev_sample
+        self.nfes += node.x_t.shape[0]
+        node.is_final = True
+
+    def _terminal_value(self, node):
+        self._finalize_terminal(node)
+        node.update_value(self.reward_fn(node.x_t).item())
     
     def _ddim_rollout_value(self, x_t, t):
         """
@@ -534,7 +584,11 @@ class MCTSImageDiffusionSampler:
         # Special case for meta-root
         if self._is_meta_root(node):
             effective_visits = max(1, node.visit_count)
-            if self.use_rollout:
+            if self.pw_alpha_root is not None:
+                meta_root_alpha = self.pw_alpha_root
+            elif self.pw_alpha is not None:
+                meta_root_alpha = self.pw_alpha
+            elif self.use_rollout:
                 meta_root_alpha = 0.8
             else:
                 alpha_min = 0.2
@@ -556,7 +610,9 @@ class MCTSImageDiffusionSampler:
         # Progressive widening: max_children = C * N(node)^alpha
         
         # progressive_width_alpha = alpha_min + (alpha_max - alpha_min) * (self.num_inference_steps - node.t) / self.num_inference_steps
-        if self.use_rollout:
+        if self.pw_alpha is not None:
+            progressive_width_alpha = self.pw_alpha
+        elif self.use_rollout:
             progressive_width_alpha = 0.8
         else:
             alpha_min = 0.2
@@ -751,8 +807,7 @@ class MCTSImageDiffusionSampler:
                         if next_node.t <= 0:
                             # Pass x_t (final image) directly to reward function
                             # r_value = np.exp(self.reward_fn(next_node.x_t))
-                            r_value = self.reward_fn(next_node.x_t).item()
-                            next_node.update_value(r_value)
+                            self._terminal_value(next_node)
                             self._backup(next_node)
 
             # 4. Process terminal nodes (if any nodes reached t=0)
@@ -760,8 +815,7 @@ class MCTSImageDiffusionSampler:
                 if node.visit_count == 1:  # Only evaluate if first visit
                     # Pass x_t (final image) directly to reward function
                     # r_value = np.exp(self.reward_fn(node.x_t))
-                    r_value = self.reward_fn(node.x_t).item()
-                    node.update_value(r_value)
+                    self._terminal_value(node)
                     self._backup(node)
                     nodes_to_remove.add(id(node))
             
@@ -792,8 +846,7 @@ class MCTSImageDiffusionSampler:
                 # Assume reward calculation and backup should happen if it's a fresh terminal state.
                 # This function is called after creating a child, so this child is new.
                 # r_value = np.exp(self.reward_fn(node.x_t))
-                r_value = self.reward_fn(node.x_t).item()
-                node.update_value(r_value)
+                self._terminal_value(node)
                 self._backup(node)
             else: # Should not happen based on above separation
                 del finalized_sim_paths[path_idx]
@@ -811,8 +864,7 @@ class MCTSImageDiffusionSampler:
                     for path_idx, node in sim_path_node_list:
                         if path_idx not in finalized_sim_paths: # If not already processed
                             # r_value = np.exp(self.reward_fn(node.x_t))
-                            r_value = self.reward_fn(node.x_t).item()
-                            node.update_value(r_value)
+                            self._terminal_value(node)
                             self._backup(node)
                             finalized_sim_paths[path_idx] = node
                     continue
@@ -836,8 +888,7 @@ class MCTSImageDiffusionSampler:
 
                     if next_node_in_rollout.t <= 0:
                         # r_value = np.exp(self.reward_fn(next_node_in_rollout.x_t))
-                        r_value = self.reward_fn(next_node_in_rollout.x_t).item()
-                        next_node_in_rollout.update_value(r_value)
+                        self._terminal_value(next_node_in_rollout)
                         self._backup(next_node_in_rollout)
                         finalized_sim_paths[path_idx] = next_node_in_rollout
                     else:
@@ -976,8 +1027,7 @@ class MCTSImageDiffusionSampler:
 
                     if one_step_child.t <= 0: # Reached terminal by this single step
                         # r_value = np.exp(self.reward_fn(one_step_child.x_t))
-                        r_value = self.reward_fn(one_step_child.x_t).item()
-                        one_step_child.update_value(r_value)
+                        self._terminal_value(one_step_child)
                         self._backup(one_step_child)
                         # next_path_nodes_update already has this terminal node for path_idx
 
@@ -1168,7 +1218,7 @@ class MCTSImageDiffusionSampler:
                     pbar.update(self.nfes - pbar.n)
                 else:
                     pbar.update(num_nfes - pbar.n)
-            elif (self.nfes + 1) % (num_nfes // 10) == 0:
+            elif (self.nfes + 1) % max(1, num_nfes // 10) == 0:
                 progress = (self.nfes + 1) / num_nfes * 100
                 print(f"Tree building progress: {progress:.1f}% (NFE {self.nfes+1}/{num_nfes})")
                 sys.stdout.flush()
@@ -1265,6 +1315,7 @@ class MCTSImageDiffusionSampler:
                         if next_node.t > 0:
                             next_active_path_indices.append(path_idx)
                         else: # Handle unlikely case where T-1 <= 0 (num_timesteps=1)
+                            self._finalize_terminal(next_node)
                             final_nodes[path_idx] = next_node
                         processed_indices_this_iter.add(path_idx)
 
@@ -1296,6 +1347,7 @@ class MCTSImageDiffusionSampler:
                         if next_node.t > 0:
                             next_active_path_indices.append(path_idx)
                         else: # Path reached t=0
+                            self._finalize_terminal(next_node)
                             final_nodes[path_idx] = next_node
                         processed_indices_this_iter.add(path_idx)
 

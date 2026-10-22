@@ -9,7 +9,10 @@ from enum import Enum
 from typing import Callable, Dict, List, Optional, Tuple, Union, Any
 import inspect
 
+from dataclasses import dataclass
+
 from src.utils.pipeline_utils import ddim_step_with_mean, get_variance, _left_broadcast
+from src.core.smc_weights import SMCWeights, gaussian_step_log_ratio, resampling_schedule
 
 # Diffusers imports
 from diffusers import DDIMPipeline
@@ -52,6 +55,13 @@ def retrieve_timesteps(
         scheduler.set_timesteps(num_inference_steps, device=device, **kwargs)
         timesteps = scheduler.timesteps
     return timesteps, num_inference_steps
+
+
+@dataclass
+class SMCOutput:
+    images: torch.Tensor        # [K, C, H, W] final particles in [-1, 1]
+    log_weights: torch.Tensor   # [K] final log importance weights (zeros without SMC)
+    nfes: int
 
 
 class PotentialType(Enum):
@@ -441,193 +451,118 @@ class FKDDDIMPipeline(DDIMPipeline):
         device: str = 'cpu',
         use_progress_bar: bool = True,
         eta: float = 0.0,
-        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None, # Default to pt for easier downstream use
-        output_type: Optional[str] = "pil",
-        return_dict: bool = True,
-        callback_on_step_end: Optional[Callable] = None,
-        callback_on_step_end_tensor_inputs: List[str] = ["image"],
-    ) -> Union[ImagePipelineOutput, Tuple]:
+        das_gamma: float = 0.008,
+        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+    ) -> SMCOutput:
         """
-        Run FKD-SMC sampling with batched processing for memory efficiency.
+        SMC/FK (use_smc), DPS-RG (use_guidance), TDS (both) and DAS (TDS + use_tempering) with the
+        UNet evaluated in chunks of processing_batch_size.
+
+        Each step evaluates the UNet once per particle (1 NFE); with guidance the same forward is
+        differentiated for the reward gradient of x0_hat (1 more NFE). Potentials use the x0
+        estimate of that forward pass. Importance weights follow src.core.smc_weights: they persist
+        across skipped resampling steps, the terminal potential is r(x_0) of the final image with
+        tempering factor 1, and the final log-weights are returned for a weighted draw.
         """
         device = self.device
+        fkd_config = fkd_config or {}
+        self.nfes = 0
 
-        # 1. Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
 
-        # 2. Prepare initial noise (image space) for the full population
         num_channels = self.unet.config.in_channels
-        height = self.unet.config.sample_size
-        width = self.unet.config.sample_size
+        height = width = self.unet.config.sample_size
         shape = (num_particles, num_channels, height, width)
+        image = randn_tensor(shape, generator=generator, device=device, dtype=self.unet.dtype)
 
-        if device.type == "mps":
-            image = randn_tensor(shape, generator=generator)
-            image = image.to(device)
-        else:
-            image = randn_tensor(shape, generator=generator, device=device, dtype=self.unet.dtype)
-
-        # Ensure required FKD args are present
+        schedule = resampling_schedule(fkd_config.get('resampling_t_start', 10), fkd_config.get('resampling_t_end', 40),
+                                       fkd_config.get('resample_frequency', 10))
+        potential_steps = set(schedule)
+        weights = None
         if use_smc:
-            fkd_constructor_args = fkd_config.copy()
-            fkd_constructor_args['num_particles'] = num_particles
-            fkd_constructor_args['device'] = self.device
-            fkd_constructor_args['time_steps'] = num_inference_steps
-            fkd_constructor_args['reward_fn'] = fkd_config['reward_fn']
-            self.fkd = FKD(**fkd_constructor_args)
-            self.potential_name = self.fkd.potential_type.name.lower()
-            adaptive_str = "adaptive" if self.fkd.adaptive_resampling else "fixed"
-        else:
-            self.fkd = None
+            if PotentialType(fkd_config.get('potential_type', 'diff')) != PotentialType.DIFF:
+                raise NotImplementedError("Only the 'diff' potential is implemented with persistent importance weights.")
+            weights = SMCWeights(num_particles, lmbda=fkd_config.get('lmbda', 1.0),
+                                 adaptive_resampling=fkd_config.get('adaptive_resampling', False),
+                                 resampling_schedule=schedule, device=device,
+                                 reward_min_value=fkd_config.get('reward_min_value', 0.0))
 
-        # Denoising loop (SMC)
-        self._num_timesteps = len(timesteps)
+        def batched_reward(x):
+            return torch.cat([reward_fn(x[b:b + processing_batch_size]).detach().reshape(-1)
+                              for b in range(0, x.shape[0], processing_batch_size)])
 
+        iterator = enumerate(timesteps)
         if use_progress_bar:
-             iterator = tqdm.tqdm(enumerate(timesteps), desc="FKD-SMC Batched Sampling")
-        else:
-            iterator = enumerate(timesteps)
+            iterator = tqdm.tqdm(iterator, total=len(timesteps), desc="SMC sampling")
 
-        log_prob_diffusion_prev = torch.zeros(num_particles, device=self.device)
-        log_prob_proposal_prev = torch.zeros(num_particles, device=self.device)
-
-        tempering_gamma = 0.008
         for i, t in iterator:
-            if use_tempering:
-                tempering_factor = min((1 + tempering_gamma)**i - 1, 1.)
-            else:
-                tempering_factor = 1.0
+            factor = min((1 + das_gamma) ** i - 1, 1.) if use_tempering else 1.0
 
-            # --- Batched UNet Prediction ---
-            noise_preds = torch.zeros((num_particles, num_channels, height, width), device=device, dtype=image.dtype)
-            rewards = torch.zeros((num_particles,), device=device)
+            noise_preds = torch.zeros_like(image)
+            rewards = None
             guidance_grads = None
-            x0_preds_for_guidance = None
             if use_guidance:
-                guidance_grads = torch.zeros((num_particles, num_channels, height, width), device=device, dtype=image.dtype)
-                x0_preds_for_guidance = torch.zeros((num_particles, num_channels, height, width), device=device, dtype=image.dtype)
-            inner_iterator = range(0, num_particles, processing_batch_size)
-
-            for batch_start in inner_iterator:
-                batch_end = min(batch_start + processing_batch_size, num_particles)
-                image_batch = image[batch_start:batch_end]
-
+                rewards = torch.zeros(num_particles, device=device)
+                guidance_grads = torch.zeros_like(image)
+            for b0 in range(0, num_particles, processing_batch_size):
+                b1 = min(b0 + processing_batch_size, num_particles)
                 if use_guidance:
                     with torch.enable_grad():
-                        image_batch.requires_grad_(True)
+                        image_batch = image[b0:b1].detach().requires_grad_(True)
                         noise_pred_batch = self.unet(image_batch, t).sample
-                        x0_pred_batch = self.scheduler.step(
-                            noise_pred_batch, t, image_batch, eta=eta, generator=generator
-                        )[1]
+                        alpha_prod_t = self.scheduler.alphas_cumprod[t]
+                        x0_pred_batch = (image_batch - (1 - alpha_prod_t) ** 0.5 * noise_pred_batch) / alpha_prod_t ** 0.5
+                        if self.scheduler.config.clip_sample:
+                            x0_pred_batch = x0_pred_batch.clamp(-self.scheduler.config.clip_sample_range,
+                                                                self.scheduler.config.clip_sample_range)
                         rewards_batch = reward_fn(x0_pred_batch)
-                        guidance_grad_batch = torch.autograd.grad(rewards_batch.sum(), image_batch)[0].detach()
-                        # gradient guidance can cause NaNs, so we set them to 0
-                        guidance_grad_batch = torch.nan_to_num(guidance_grad_batch)
-                        guidance_grad_batch = guidance_grad_batch * tempering_factor
-                        image_batch.requires_grad_(False)
-
-                        rewards[batch_start:batch_end] = rewards_batch
-                        noise_preds[batch_start:batch_end] = noise_pred_batch
-                        guidance_grads[batch_start:batch_end] = guidance_grad_batch
-                        x0_preds_for_guidance[batch_start:batch_end] = x0_pred_batch.detach()
+                        grad = torch.autograd.grad(rewards_batch.sum(), image_batch)[0].detach()
+                    guidance_grads[b0:b1] = torch.nan_to_num(grad) * factor
+                    rewards[b0:b1] = rewards_batch.detach()
+                    noise_preds[b0:b1] = noise_pred_batch.detach()
+                    self.nfes += 2 * (b1 - b0)
                 else:
-                    noise_pred_batch = self.unet(image_batch, t).sample
-                    noise_preds[batch_start:batch_end] = noise_pred_batch
-            
-            # --- Scheduler Step (Full Population) ---
+                    noise_preds[b0:b1] = self.unet(image[b0:b1], t).sample
+                    self.nfes += b1 - b0
+
             prev_image, x0_pred, prev_image_mean = ddim_step_with_mean(
                 self.scheduler, noise_preds, t, image, eta=eta, generator=generator, return_dict=True
             )
 
-            # --- Resampling Step --- 
-            resampled_indices = torch.arange(num_particles, device=self.device)
-            if use_smc:
-                should_resample = self.fkd.is_potential_resampling_step(i)
-                if should_resample:
-                    if use_guidance and x0_preds_for_guidance is not None:
-                        x0_for_reward = x0_preds_for_guidance
-                    else:
-                        if use_rollout:
-                            x0_for_reward = self._perform_batched_rollout(
-                                start_images=image,
-                                start_timestep_index=i,
-                                all_timesteps=timesteps,
-                                processing_batch_size=processing_batch_size,
-                                generator=generator,
-                                eta=eta,
-                                use_progress_bar=use_progress_bar, 
-                            )
-                        else:
-                            x0_for_reward = x0_pred 
+            if use_smc and i in potential_steps:
+                if use_rollout and not use_guidance:
+                    x0_for_reward = self._perform_batched_rollout(
+                        start_images=image, start_timestep_index=i, all_timesteps=timesteps,
+                        processing_batch_size=processing_batch_size, generator=generator, eta=eta,
+                        use_progress_bar=False)
+                    self.nfes += num_particles * (len(timesteps) - i)
+                    rewards = batched_reward(x0_for_reward)
+                elif rewards is None:
+                    rewards = batched_reward(x0_pred)
+                indices = weights.potential_step(i, factor * rewards)
+                if indices is not None:
+                    prev_image = prev_image[indices]
+                    prev_image_mean = prev_image_mean[indices]
+                    if guidance_grads is not None:
+                        guidance_grads = guidance_grads[indices]
 
-                    # Perform the potential resampling using the calculated x0 for rewards
-                    resampled_indices = self.fkd.resample(
-                        sampling_idx=i,
-                        x0_preds_for_reward=x0_for_reward,
-                        log_prob_diffusion=log_prob_diffusion_prev,
-                        log_prob_proposal=log_prob_proposal_prev,
-                        tempering_factor=tempering_factor,
-                    )
-
-                    # reset log_prob_diffusion_prev and log_prob_proposal_prev after resampling
-                    log_prob_diffusion_prev = torch.zeros(num_particles, device=self.device)
-                    log_prob_proposal_prev = torch.zeros(num_particles, device=self.device)                
-
-            prev_timestep = (
-                t - self.scheduler.config.num_train_timesteps // self.scheduler.num_inference_steps
-            )
-            prev_timestep = torch.clamp(prev_timestep, 0, self.scheduler.config.num_train_timesteps - 1)
-
-            variance = get_variance(self.scheduler, t, prev_timestep)
-            variance = eta**2 * _left_broadcast(variance, prev_image.shape).to(device)
-            std_dev_t = variance.sqrt()
+            prev_timestep = t - self.scheduler.config.num_train_timesteps // self.scheduler.num_inference_steps
+            variance = get_variance(self.scheduler, t, torch.clamp(prev_timestep, 0, self.scheduler.config.num_train_timesteps - 1))
+            variance = eta ** 2 * _left_broadcast(variance, prev_image.shape).to(device)
+            if prev_timestep < 0:
+                variance = torch.zeros_like(variance)   # last step: deterministic, no guidance shift
 
             if use_guidance:
-                prev_image = prev_image + variance * guidance_scale * guidance_grads
+                shift = variance * guidance_scale * guidance_grads
+                prev_image = prev_image + shift
+                if weights is not None:
+                    weights.add_log_ratio(gaussian_step_log_ratio(prev_image, prev_image_mean, shift, variance))
+            image = prev_image
 
-            log_prob_diffusion = -0.5 * (prev_image - prev_image_mean).pow(2) / variance - torch.log(std_dev_t) - torch.log(torch.sqrt(2 * torch.as_tensor(math.pi)))
-            log_prob_diffusion = log_prob_diffusion.sum(dim=tuple(range(1, log_prob_diffusion.ndim)))
-            if use_guidance and use_smc:
-                log_prob_proposal = -0.5 * (prev_image - prev_image_mean - variance * guidance_scale * guidance_grads).pow(2) / variance - torch.log(std_dev_t) - torch.log(torch.sqrt(2 * torch.as_tensor(math.pi)))
-                log_prob_proposal = log_prob_proposal.sum(dim=tuple(range(1, log_prob_proposal.ndim)))
-            else:
-                log_prob_proposal = log_prob_diffusion
-            log_prob_diffusion[:] = torch.nan_to_num(log_prob_diffusion, nan=-1e6)
-            log_prob_proposal[:] = torch.nan_to_num(log_prob_proposal, nan=1e6)
-
-            # cumulative until next resampling
-            image = prev_image[resampled_indices]
-            log_prob_diffusion_prev += log_prob_diffusion[resampled_indices]
-            log_prob_proposal_prev += log_prob_proposal[resampled_indices]
-
-            # --- Callback --- 
-            if callback_on_step_end is not None:
-                callback_kwargs = {}
-                for k in callback_on_step_end_tensor_inputs:
-                     # Adapt keys if necessary
-                     if k == "image": callback_kwargs["image"] = image
-                     else: callback_kwargs[k] = locals()[k]
-                callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
-                image = callback_outputs.pop("image", image)
-
-        # 5. Post-processing
-        # Output is already in image space [0, 1] or [-1, 1] depending on training
-        # Usually [-1, 1] for latent diffusers, but image space here might be [0, 1]
-        # Add clamping/normalization if necessary based on model output range
-        # image = (image / 2 + 0.5).clamp(0, 1) # Example if output is [-1, 1]
-
-        if output_type == "pil":
-            # Assuming output is [-1, 1], scale to [0, 1] before converting
-            image_out = (image / 2 + 0.5).clamp(0, 1)
-            image_out = image_out.cpu().permute(0, 2, 3, 1).numpy()
-            image_out = self.numpy_to_pil(image_out)
-        elif output_type == "np":
-            image_out = image.cpu().numpy()
-        else: # Default "pt"
-             image_out = image
-
-        if not return_dict:
-            return (image_out,)
-
-        return ImagePipelineOutput(images=image_out)
+        log_weights = torch.zeros(num_particles, device=device)
+        if weights is not None:
+            weights.final_step(batched_reward(image))
+            log_weights = weights.log_w
+            logger.info(f"Final ESS ratio {weights.ess_ratio():.3f}; resampling events {weights.num_resampling_events}")
+        return SMCOutput(images=image, log_weights=log_weights, nfes=self.nfes)
