@@ -2,7 +2,7 @@
 #SBATCH -J A-M0-sd
 #SBATCH -p gpu_a800
 #SBATCH --gpus=1
-#SBATCH --time=01:30:00
+#SBATCH --time=03:00:00
 #SBATCH -o logs/%x_%j.out
 #SBATCH -e logs/%x_%j.err
 # A-R003: SD-v1.5 + ImageReward, one prompt, 10^3 NFE: Best-of-N, FK, DTS, DTS*, then offline metrics.

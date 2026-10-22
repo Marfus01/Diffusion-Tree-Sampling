@@ -2,7 +2,7 @@
 #SBATCH -J A-M0-2d
 #SBATCH -p gpu_a800
 #SBATCH --gpus=1
-#SBATCH --time=01:30:00
+#SBATCH --time=03:00:00
 #SBATCH -o logs/%x_%j.out
 #SBATCH -e logs/%x_%j.err
 # A-R001 unit checks, A-R002 2D gaussian_mixture check (code defaults, 1 seed),
