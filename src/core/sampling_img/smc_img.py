@@ -497,7 +497,9 @@ class FKDDDIMPipeline(DDIMPipeline):
             iterator = tqdm.tqdm(iterator, total=len(timesteps), desc="SMC sampling")
 
         for i, t in iterator:
+            # DAS: the twist of x_t uses lambda_t, the proposal x_t -> x_{t-1} uses lambda_{t-1}
             factor = min((1 + das_gamma) ** i - 1, 1.) if use_tempering else 1.0
+            factor_next = min((1 + das_gamma) ** (i + 1) - 1, 1.) if use_tempering else 1.0
 
             noise_preds = torch.zeros_like(image)
             rewards = None
@@ -518,7 +520,7 @@ class FKDDDIMPipeline(DDIMPipeline):
                                                                 self.scheduler.config.clip_sample_range)
                         rewards_batch = reward_fn(x0_pred_batch)
                         grad = torch.autograd.grad(rewards_batch.sum(), image_batch)[0].detach()
-                    guidance_grads[b0:b1] = torch.nan_to_num(grad) * factor
+                    guidance_grads[b0:b1] = torch.nan_to_num(grad) * factor_next
                     rewards[b0:b1] = rewards_batch.detach()
                     noise_preds[b0:b1] = noise_pred_batch.detach()
                     self.nfes += 2 * (b1 - b0)

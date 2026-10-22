@@ -14,6 +14,7 @@ lambda * r(x_0) + sum_s log(p/q), i.e. the target is p_theta,0(x_0) e^{lambda r(
 The log-weight is reset to zero only when the population is resampled. A potential step
 that skips resampling (adaptive mode with ESS above the threshold) keeps the accumulated
 weight, and the final weights are returned so that evaluation samples are drawn by weight.
+Resampling during sampling is systematic; evaluation draws (`draw`) are i.i.d. multinomial.
 
 A particle whose state, reward or log-ratio becomes non-finite (diverging gradient guidance)
 gets log-weight -inf: it is never selected again and is counted in `num_invalid`. Drawing
@@ -91,7 +92,9 @@ class SMCWeights:
             do_resample = sampling_idx in self.resampling_schedule
         if not do_resample:
             return None
-        indices = self.draw(self.num_particles)
+        if not torch.isfinite(self.log_w).any():
+            raise SMCDivergedError("SMC population has no particle with a finite weight (diverged).")
+        indices = systematic_resample(torch.softmax(self.log_w.double(), dim=0), self.num_particles)
         self.log_w = torch.zeros_like(self.log_w)
         self.prev_reward = self.prev_reward[indices]
         self.num_resampling_events += 1
@@ -111,6 +114,61 @@ class SMCWeights:
             raise SMCDivergedError("SMC population has no particle with a finite weight (diverged).")
         probs = torch.softmax(self.log_w.double(), dim=0)
         return torch.multinomial(probs, n, replacement=True)
+
+
+class MaxPotentialResampler:
+    """FK-steering 'max' potential (Singhal et al. 2025), used as a search method.
+
+    At a potential step the population is resampled in proportion to exp(lambda * m), where m is
+    the running maximum of each particle's intermediate rewards along its ancestry (m = -inf
+    before the first potential step). The search output is the final particle with the highest
+    reward, so the product-of-potentials correction that would make the final weights target
+    p e^{lambda r} is not applied, and no importance weight is carried between potential steps.
+    """
+
+    def __init__(self, num_particles: int, lmbda: float, adaptive_resampling: bool,
+                 resampling_schedule: Iterable[int], device, ess_threshold: float = 0.5):
+        self.num_particles = num_particles
+        self.lmbda = lmbda
+        self.adaptive_resampling = adaptive_resampling
+        self.resampling_schedule = set(resampling_schedule)
+        self.ess_threshold = ess_threshold
+        self.running_max = torch.full((num_particles,), -float('inf'), device=device)
+        self.num_resampling_events = 0
+
+    def potential_step(self, sampling_idx: int, reward: torch.Tensor) -> Optional[torch.Tensor]:
+        """Updates the running maximum with `reward` [K]; returns ancestor indices [K] when the
+        population is resampled, otherwise None."""
+        reward = reward.to(self.running_max)
+        reward = torch.where(torch.isfinite(reward), reward, torch.full_like(reward, -float('inf')))
+        self.running_max = torch.maximum(self.running_max, reward)
+        log_g = self.lmbda * self.running_max
+        if not torch.isfinite(log_g).any():
+            raise SMCDivergedError("SMC population has no particle with a finite potential (diverged).")
+        probs = torch.softmax(log_g.double(), dim=0)
+        if self.adaptive_resampling:
+            do_resample = float(1.0 / (probs.pow(2).sum() * self.num_particles)) < self.ess_threshold
+        else:
+            do_resample = sampling_idx in self.resampling_schedule
+        if not do_resample:
+            return None
+        indices = systematic_resample(probs, self.num_particles)
+        self.running_max = self.running_max[indices]
+        self.num_resampling_events += 1
+        return indices
+
+
+def systematic_resample(probs: torch.Tensor, n: int) -> torch.Tensor:
+    """Systematic resampling: n ancestor indices from normalized weights `probs` [K].
+
+    One U ~ Uniform(0, 1) gives the points u_m = (m + U) / n, m = 0..n-1, and index j is taken
+    for every u_m in (C_{j-1}, C_j] with C the cumulative weights. Particle j gets
+    floor(n p_j) or ceil(n p_j) copies, with expectation n p_j.
+    """
+    cdf = torch.cumsum(probs.double(), dim=0)
+    cdf = cdf / cdf[-1]
+    u = (torch.arange(n, dtype=torch.float64, device=probs.device) + torch.rand((), dtype=torch.float64, device=probs.device)) / n
+    return torch.searchsorted(cdf, u, right=False).clamp(max=probs.shape[0] - 1)
 
 
 def gaussian_step_log_ratio(x_prev, base_mean, shift, variance):

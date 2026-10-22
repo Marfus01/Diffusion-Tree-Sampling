@@ -90,6 +90,8 @@ def parse_script_args():
     sgroup.add_argument('--guidance_scale', type=float, default=1.0, help='Scale for reward-based guidance.')
     sgroup.add_argument('--das_gamma', type=float, default=0.008, help='DAS tempering rate gamma.')
     sgroup.add_argument('--adaptive_resampling', type=str2bool, help='ESS-adaptive resampling for SMC/TDS/DAS.')
+    sgroup.add_argument('--resampling_steps', nargs=3, type=int, metavar=('START', 'END', 'FREQ'),
+                        help='SMC/FK, TDS and DAS potential and resampling steps: sampling indices range(START, END + 1, FREQ), 0 = first denoising step (default: the DTS branching schedule; 0 T-1 1 = every step). DTS branching is set separately.')
     sgroup.add_argument('--pw_alpha', type=float, help='DTS progressive-widening alpha (default: original hard-coded values).')
     sgroup.add_argument('--pw_alpha_root', type=float, help='DTS progressive-widening alpha of the meta-root only.')
     sgroup.add_argument('--eps_explore', type=float, help='Constant epsilon for DTS tree construction (default: linear 0.1 -> 0.05).')
@@ -127,6 +129,8 @@ def build_config(args, seed):
     if args.population_size is not None: config.sampling.population_size = args.population_size
     if args.potential_type is not None: config.fkd.potential_type = args.potential_type
     if args.adaptive_resampling is not None: config.fkd.adaptive_resampling = args.adaptive_resampling
+    if args.resampling_steps is not None:
+        config.fkd.resampling_t_start, config.fkd.resampling_t_end, config.fkd.resample_frequency = args.resampling_steps
     if args.mcts_batch_size is not None: config.mcts.batch_size = args.mcts_batch_size
     if args.no_value_eval: config.eval.evaluate_value = False
     if args.value_timesteps is not None: config.eval.value_eval_timesteps = args.value_timesteps

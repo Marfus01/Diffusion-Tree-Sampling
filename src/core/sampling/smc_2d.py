@@ -131,7 +131,9 @@ class SMCDiffusion2DSampler:
             iterator = tqdm.tqdm(iterator, total=len(timesteps), desc="Sampling")
 
         for i, t in iterator:
+            # DAS: the twist of x_t uses lambda_t, the proposal x_t -> x_{t-1} uses lambda_{t-1}
             factor = tempering_factor(i, self.das_gamma) if self.use_tempering else 1.0
+            factor_next = tempering_factor(i + 1, self.das_gamma) if self.use_tempering else 1.0
             is_potential_step = self.use_smc and i in potential_steps
 
             guidance_grad = None
@@ -143,7 +145,7 @@ class SMCDiffusion2DSampler:
                     reward_g = self.reward_fn(x0_pred)
                     guidance_grad = torch.autograd.grad(reward_g.sum(), x_in)[0]
                 # gradient guidance can produce NaNs/overflow; zero/clip them as in the original code
-                guidance_grad = torch.nan_to_num(guidance_grad, nan=0.0, posinf=1e4, neginf=-1e4) * factor
+                guidance_grad = torch.nan_to_num(guidance_grad, nan=0.0, posinf=1e4, neginf=-1e4) * factor_next
                 noise_pred = noise_pred.detach()
                 x0_pred = x0_pred.detach()
                 reward = reward_g.detach()

@@ -13,7 +13,7 @@ import logging
 @dataclass
 class SDSMCOutput:
     images: list                # final images (PIL with output_type="pil")
-    log_weights: torch.Tensor   # [K] final log importance weights
+    log_weights: torch.Tensor   # [K] final log importance weights ('diff'); zeros for the 'max' search potential
     final_rewards: torch.Tensor # [K] guiding reward of the final images
     nfes: int
 
@@ -208,7 +208,7 @@ import inspect
 from typing import Any, Callable, Dict, List, Optional, Union
 
 from src.core.rewards import get_reward_function
-from src.core.smc_weights import SMCWeights
+from src.core.smc_weights import SMCWeights, MaxPotentialResampler
 
 import torch
 from packaging import version
@@ -1214,12 +1214,18 @@ class FKDStableDiffusion(
             self.reward_evals += x0_latents.shape[0]
             return torch.cat(out)
 
-        if PotentialType(fkd_args.get("potential_type", "diff")) != PotentialType.DIFF:
-            raise NotImplementedError("Only the 'diff' potential is implemented with persistent importance weights.")
+        potential_type = PotentialType(fkd_args.get("potential_type", "diff"))
         schedule = list(range(fkd_args["resampling_t_start"], fkd_args["resampling_t_end"] + 1, fkd_args["resample_frequency"]))
-        weights = SMCWeights(num_particles, lmbda=fkd_args["lmbda"], adaptive_resampling=fkd_args["adaptive_resampling"],
-                             resampling_schedule=schedule, device=device,
-                             reward_min_value=fkd_args.get("reward_min_value", 0.0))
+        if potential_type == PotentialType.DIFF:
+            weights = SMCWeights(num_particles, lmbda=fkd_args["lmbda"], adaptive_resampling=fkd_args["adaptive_resampling"],
+                                 resampling_schedule=schedule, device=device,
+                                 reward_min_value=fkd_args.get("reward_min_value", 0.0))
+        elif potential_type == PotentialType.MAX:
+            weights = MaxPotentialResampler(num_particles, lmbda=fkd_args["lmbda"],
+                                            adaptive_resampling=fkd_args["adaptive_resampling"],
+                                            resampling_schedule=schedule, device=device)
+        else:
+            raise NotImplementedError(f"potential_type {potential_type.value} is not implemented for batched SMC.")
         use_rollout = fkd_args.get("use_rollout", False)
         self.nfes = 0
         self.reward_evals = 0
@@ -1366,11 +1372,15 @@ class FKDStableDiffusion(
                                       for r in get_reward_function(fkd_args["guidance_reward_fn"], images=list(image[b:b + reward_batch_size]),
                                                                    prompts=[prompt_list[0]] * len(image[b:b + reward_batch_size]))],
                                      device=device).float()
-        weights.final_step(final_rewards)
         self.reward_evals += len(image)
+        if potential_type == PotentialType.DIFF:
+            weights.final_step(final_rewards)
+            log_weights = weights.log_w
+        else:
+            log_weights = torch.zeros(num_particles, device=device)   # search: output is the argmax of final_rewards
 
         self.maybe_free_model_hooks()
-        return SDSMCOutput(images=image, log_weights=weights.log_w, final_rewards=final_rewards, nfes=self.nfes)
+        return SDSMCOutput(images=image, log_weights=log_weights, final_rewards=final_rewards, nfes=self.nfes)
 
 
 # FK Steering Change

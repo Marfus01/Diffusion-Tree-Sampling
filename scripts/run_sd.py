@@ -336,10 +336,14 @@ def run_bon(config, prompt, reward_name, pipeline):
 
 @torch.no_grad()
 def run_fkd(config, prompt, reward_name, pipeline):
-    """FK steering (SMC). Each NFE point is a separate run with K = NFE // T particles; the
-    population_size evaluation images are drawn with replacement by the final importance weights."""
+    """FK steering (SMC). Each NFE point is a separate run with K = NFE // T particles.
+
+    'diff' potential (sampling): the population_size evaluation images are drawn with replacement
+    by the final importance weights. 'max' potential (search, FKD-max): the final particle with the
+    highest guiding reward is the output, repeated population_size times as for Best-of-N."""
     metrics_data = {}
-    method_name = "FKD-R" if config.fkd.use_rollout else "FKD"
+    search = config.fkd.potential_type == "max"
+    method_name = ("FKD-R" if config.fkd.use_rollout else "FKD") + ("-max" if search else "")
     fkd_args = {
         "use_smc": True,
         "potential_type": config.fkd.potential_type,
@@ -379,7 +383,10 @@ def run_fkd(config, prompt, reward_name, pipeline):
         elapsed = time.time() - t0
         peak_mem = peak_memory_mb()
         w = torch.softmax(out.log_weights.double(), dim=0)
-        idx = torch.multinomial(w, config.sampling.population_size, replacement=True).tolist()
+        if search:
+            idx = [int(torch.argmax(out.final_rewards))] * config.sampling.population_size
+        else:
+            idx = torch.multinomial(w, config.sampling.population_size, replacement=True).tolist()
         eval_images = [out.images[i] for i in idx]
         metrics = evaluate_images(eval_images, prompt, config)
         metrics.update({'NFEs': nfe_target, 'ActualNFEs': out.nfes, 'ActualParticles': n_particles,
@@ -559,7 +566,8 @@ def worker_process(gpu_id, config, prompt_subset):
         # for reward_name in current_config.eval.reward_fns:
         for reward_name in current_config.guiding_reward_fns:
             logger.info(f"[GPU {gpu_id}] Guiding with Reward: {reward_name} for {method}")
-            method_label = method + ("-max" if method.startswith("MCTS") and current_config.maximize else "")
+            method_label = method + ("-max" if (method.startswith("MCTS") and current_config.maximize)
+                                     or (method.startswith("FKD") and current_config.fkd.potential_type == "max") else "")
             method_guidance_id = f"{method_label}_guided_by_{reward_name}"
             prompt_results_dfs_for_reward = [] # Store DFs for this specific method, reward, and its prompts
             for prompt in prompt_subset:

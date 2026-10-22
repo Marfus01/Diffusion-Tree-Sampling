@@ -6,7 +6,8 @@ import numpy as np
 import pytest
 import torch
 
-from src.core.smc_weights import SMCWeights, SMCDivergedError, gaussian_step_log_ratio
+from src.core.smc_weights import (SMCWeights, SMCDivergedError, MaxPotentialResampler, gaussian_step_log_ratio,
+                                  systematic_resample)
 from src.core.sampling.smc_2d import SMCDiffusion2DSampler
 from src.core.sampling.mcts_parallel import MCTSDiffusionSampler
 from src.models.gmm_analytic import GMMInverseProblem, AnalyticGMMDiffusion, sliced_wasserstein
@@ -43,6 +44,32 @@ def test_resampling_resets_weights_and_baseline():
     idx = w.potential_step(20, r)
     assert idx is not None and torch.all(w.log_w == 0)
     torch.testing.assert_close(w.prev_reward, r[idx])
+
+
+def test_systematic_resample_offspring_counts():
+    torch.manual_seed(0)
+    p = torch.softmax(torch.randn(50, dtype=torch.float64) * 2, 0)
+    p[3] = 0.0
+    p = p / p.sum()
+    n, reps = 200, 2000
+    total = torch.zeros(50, dtype=torch.float64)
+    for _ in range(reps):
+        counts = torch.bincount(systematic_resample(p, n), minlength=50).double()
+        assert torch.all(counts >= torch.floor(n * p)) and torch.all(counts <= torch.ceil(n * p))
+        total += counts
+    assert total[3] == 0
+    torch.testing.assert_close(total / reps, n * p, atol=0.05, rtol=0)
+
+
+def test_max_potential_running_max_and_resampling():
+    torch.manual_seed(0)
+    m = MaxPotentialResampler(3, lmbda=10.0, adaptive_resampling=False, resampling_schedule=[10], device='cpu')
+    assert m.potential_step(5, torch.tensor([1.0, -1.0, 0.0])) is None
+    torch.testing.assert_close(m.running_max, torch.tensor([1.0, -1.0, 0.0]))
+    idx = m.potential_step(10, torch.tensor([-2.0, -2.0, -2.0]))
+    # potentials exp(10 * [1, -1, 0]): particle 0 carries almost all mass
+    assert idx is not None and torch.all(idx == 0)
+    torch.testing.assert_close(m.running_max, torch.ones(3))
 
 
 @pytest.fixture(scope="module")
