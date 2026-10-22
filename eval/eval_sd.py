@@ -3,7 +3,7 @@
 Per (method, prompt, NFE): mean and max of ImageReward, mean HPSv2 (v2.1), mean LAION aesthetic
 score, CLIP pairwise diversity (mean squared distance of normalized CLIP ViT-L/14 image features,
 the repository's do_clip_score_diversity) and LPIPS diversity (mean LPIPS-alex over image pairs),
-and the number of distinct images. Prompts are read from --prompts_file to map directory names back.
+and the number of distinct images. Prompts (--prompts_file or --prompts) map directory names back.
 """
 import argparse
 import itertools
@@ -35,15 +35,19 @@ def lpips_diversity(images, model, device):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--image_dir', required=True, help='<run_dir>/images/<guiding reward>')
-    parser.add_argument('--prompts_file', required=True)
+    parser.add_argument('--prompts_file', help='JSON prompts file used for the run')
+    parser.add_argument('--prompts', nargs='+', help='Prompts given on the run_sd.py command line')
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--out', required=True)
     args = parser.parse_args()
 
     import lpips
     lp = lpips.LPIPS(net='alex').to(args.device).eval()
-    data = json.load(open(args.prompts_file))
-    prompts = data['prompts'] if isinstance(data, dict) else data
+    if args.prompts:
+        prompts = args.prompts
+    else:
+        data = json.load(open(args.prompts_file))
+        prompts = data['prompts'] if isinstance(data, dict) else data
     by_slug = {slug(p): p for p in prompts}
 
     rows = []
