@@ -9,9 +9,10 @@
 #   main: Best-of-N, FK (diff potential, lambda=1), DTS
 #   star: DTS* (--maximize)
 #   max:  FK-max (max potential, lambda=10, best final particle)
+#   dts:  DTS alone (e.g. with SD_EXTRA="--pw_alpha 0.8")
 # then the offline metrics of eval/eval_sd.py. Submit with --array=0..(#words - 1) and --time.
 set -euo pipefail
-export DTS_CODE=$HOME/run/dts/wt-m3
+export DTS_CODE=${DTS_CODE:-$HOME/run/dts/wt-m3}
 source $DTS_CODE/jobs/stageA/env.sh
 
 STAGE=${STAGE:?}
@@ -43,6 +44,7 @@ for V in $VARIANTS; do
     main) python -m scripts.run_sd $COMMON --do_bon --do_fkd --do_mcts_rollout --exp_name m3_${TAG}_main ;;
     star) python -m scripts.run_sd $COMMON --do_mcts_rollout --maximize --exp_name m3_${TAG}_star ;;
     max)  python -m scripts.run_sd $COMMON --do_fkd --potential_type max --lambda 10 --exp_name m3_${TAG}_max ;;
+    dts)  python -m scripts.run_sd $COMMON --do_mcts_rollout --exp_name m3_${TAG}_dts ;;
   esac
 done
 
