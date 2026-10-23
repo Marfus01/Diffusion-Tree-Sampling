@@ -1,0 +1,6 @@
+# A-R007 SMC family and DPS-RG: the 1e5-NFE best of each method's last calibrated item, kept after
+# the 1e6-NFE recheck (A-R006, calibration class 5, seed 0). Branch times are steps 10, 20, 30, 40.
+FK|--do_smc --adaptive_resampling false
+TDS|--do_smc_guidance --guidance_scale 0.5
+DAS|--do_smc_guidance_tempering --guidance_scale 0.5 --das_gamma 0.0142 --resampling_steps 0 49 1 --adaptive_resampling false
+DPS-RG|--do_guidance --guidance_scale 8
