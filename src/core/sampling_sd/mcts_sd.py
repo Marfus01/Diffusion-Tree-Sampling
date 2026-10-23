@@ -173,6 +173,7 @@ class MCTSStableDiffusionSampler:
                  output_dir: str = None,
                  visualization_timesteps: List[int] = None,
                  pw_alpha_root: Optional[float] = None,
+                 pw_alpha: Optional[float] = None,
                  negative_prompt: str = ""):
         """
         Args:
@@ -221,6 +222,9 @@ class MCTSStableDiffusionSampler:
         # meta-root widening exponent with rollouts; the hard-coded value is 0.4, the authors use
         # 0.8 for their T2I runs (issue #2)
         self.pw_alpha_root = pw_alpha_root
+        # widening exponent of the other expandable nodes with rollouts (hard-coded 0.4, which the
+        # authors kept for T2I; the paper's appendix F gives 0.8 for all nodes)
+        self.pw_alpha = pw_alpha
         
         # These will be set up in setup_diffusion
         self.prompt_embeds = None
@@ -744,7 +748,7 @@ class MCTSStableDiffusionSampler:
         
         # progressive_width_alpha = alpha_min + (alpha_max - alpha_min) * (self.num_inference_steps - node.t) / self.num_inference_steps
         if self.use_rollout:
-            progressive_width_alpha = 0.4
+            progressive_width_alpha = self.pw_alpha if self.pw_alpha is not None else 0.4
             progressive_width_const = 2
         else:
             alpha_min = 0.3

@@ -90,6 +90,8 @@ def parse_script_args():
                         help='DTS*: argmax selection in tree construction and traversal (default: DTS, sampling by value).')
     sgroup.add_argument('--pw_alpha_root', type=float, default=0.8,
                         help='Meta-root widening exponent of DTS/DTS* (0.8 as used by the authors for T2I, issue #2; code default 0.4).')
+    sgroup.add_argument('--pw_alpha', type=float, default=0.4,
+                        help='Widening exponent of the non-root nodes of DTS/DTS* (code value 0.4; paper 0.8).')
     sgroup.add_argument('--adaptive_resampling', type=lambda v: v.lower() in ('1', 'true', 'yes'),
                         help='ESS-adaptive resampling for FK (true/false).')
 
@@ -117,6 +119,7 @@ def parse_script_args():
     config.bon_enabled = args.do_bon
     config.maximize = args.maximize
     config.pw_alpha_root = args.pw_alpha_root
+    config.pw_alpha = args.pw_alpha
     config.prompt_ids = args.prompt_ids
     config.no_compile = args.no_compile
     if args.no_compile: os.environ["DTS_NO_COMPILE"] = "1"
@@ -275,6 +278,7 @@ def run_mcts(config, prompt, reward_name, pipeline):
         output_dir=str(Path(config.paths.image_dir)),
         visualization_timesteps=list(config.mcts.expand_timesteps + [0]),
         pw_alpha_root=config.pw_alpha_root,
+        pw_alpha=config.pw_alpha,
         negative_prompt=config.dataset.negative_prompt,
     )
     mcts_sampler.initialize_root_nodes()
