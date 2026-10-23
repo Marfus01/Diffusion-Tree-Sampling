@@ -11,6 +11,7 @@ For each samples_<method>_<class>_N<nfe>.npz in --run_dir/metrics:
 Duplicates from with-replacement draws stay in the evaluated set.
 """
 import argparse
+import os
 import re
 from pathlib import Path
 
@@ -39,12 +40,29 @@ def inception_features(images_u8, model, device, batch=250):
     return torch.cat(feats).numpy()
 
 
+class _Processed(torch.utils.data.Dataset):
+    """uint8 [N, 3, H, W] images through a Hugging Face image processor, one image per item, so
+    that DataLoader workers run the (PIL) preprocessing in parallel."""
+    def __init__(self, images_u8, processor):
+        self.images, self.processor = images_u8, processor
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, i):
+        return self.processor(images=self.images[i].permute(1, 2, 0).numpy(), return_tensors="pt")['pixel_values'][0]
+
+
+def processed_batches(images_u8, processor, batch=250):
+    workers = max(len(os.sched_getaffinity(0)) - 1, 0)
+    return torch.utils.data.DataLoader(_Processed(images_u8, processor), batch_size=batch, num_workers=workers)
+
+
 @torch.no_grad()
-def clip_embeddings(images_u8, model, processor, device, batch=250):
+def clip_embeddings(images_u8, model, processor, device):
     out = []
-    for b in range(0, len(images_u8), batch):
-        inputs = processor(images=list(images_u8[b:b + batch].permute(0, 2, 3, 1).numpy()), return_tensors="pt").to(device)
-        e = model.get_image_features(**inputs)
+    for pixels in processed_batches(images_u8, processor):
+        e = model.get_image_features(pixel_values=pixels.to(device))
         out.append(F.normalize(e.float(), dim=-1).cpu())
     return torch.cat(out).double()
 
@@ -70,11 +88,10 @@ def clip_diversity(e, max_pairs=10_000, seed=0):
 
 
 @torch.no_grad()
-def heldout_accuracy(images_u8, class_idx, model, processor, device, batch=250):
+def heldout_accuracy(images_u8, class_idx, model, processor, device):
     correct = 0
-    for b in range(0, len(images_u8), batch):
-        inputs = processor(images=list(images_u8[b:b + batch].permute(0, 2, 3, 1).numpy()), return_tensors="pt").to(device)
-        pred = model(**inputs).logits.argmax(-1)
+    for pixels in processed_batches(images_u8, processor):
+        pred = model(pixel_values=pixels.to(device)).logits.argmax(-1)
         correct += int((pred == class_idx).sum())
     return correct / len(images_u8)
 
