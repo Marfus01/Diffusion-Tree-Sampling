@@ -9,7 +9,7 @@ import torch
 from src.core.smc_weights import (SMCWeights, SMCDivergedError, MaxPotentialResampler, gaussian_step_log_ratio,
                                   systematic_resample)
 from src.core.sampling.smc_2d import SMCDiffusion2DSampler
-from src.core.sampling.mcts_parallel import MCTSDiffusionSampler
+from src.core.sampling.mcts_parallel import MCTSDiffusionSampler, tree_statistics
 from src.models.gmm_analytic import GMMInverseProblem, AnalyticGMMDiffusion, sliced_wasserstein
 
 FKD = {'potential_type': 'diff', 'lmbda': 1.0, 'adaptive_resampling': False, 'resample_frequency': 20,
@@ -183,3 +183,52 @@ def test_diverging_guidance_is_reported_not_masked():
         run_smc(model, problem, 256, use_smc=True, use_guidance=True, adaptive=True, guidance_scale=1.0)
     out, _ = run_smc(model, problem, 256, use_smc=True, use_guidance=True, adaptive=True, guidance_scale=0.5)
     assert torch.isfinite(out['log_weights']).all() and torch.isfinite(out['samples']).all()
+
+
+def _grow(model, problem, with_stats, budgets=(2_000, 6_000)):
+    torch.manual_seed(0)
+    random.seed(0)
+    s = MCTSDiffusionSampler(model, reward_fn=lambda x: problem.log_likelihood(x).numpy(),
+                             expand_timesteps=[100, 80, 60, 40, 20], num_nfes=max(budgets), device='cpu',
+                             use_progress_bar=False, use_rollout=True, batch_size=1, pw_alpha=0.3, pw_alpha_root=0.4)
+    s.initialize_root_nodes()
+    out, stats = [], None
+    abar = model.alphas_cumprod.double()
+    for n in budgets:
+        s.build_search_tree(num_nfes=n)
+        if with_stats:
+            stats = tree_statistics(s.meta_root, s.expand_timesteps, lambda x, t: problem.log_soft_value(x, abar[t]))
+        out.append(s.sample_from_tree(500)[0])
+    return s, out, stats
+
+
+def test_tree_statistics_is_read_only_and_matches_traversal(gmm2):
+    problem, model = gmm2
+    _, plain, _ = _grow(model, problem, with_stats=False)
+    s, logged, (stats, leaves) = _grow(model, problem, with_stats=True)
+    for a, b in zip(plain, logged):
+        assert torch.equal(a, b)
+    nodes = tree_nodes(s.meta_root)
+    terminal = [n for n in nodes if n.t <= 0 and not n.children]
+    assert stats['n_leaves'] == len(terminal) == len(leaves)
+    assert sum(stats['leaf_branch_depth'].values()) == len(terminal)
+    assert stats['n_roots'] == len(s.meta_root.children)
+    for t in (80, 60, 40, 20):
+        at_t = [n for n in nodes if n.t == t]
+        assert stats['layers'][str(t)]['nodes'] == len(at_t)
+        assert stats['layers'][str(t)]['branch_nodes'] == sum(len(n.children) > 1 for n in at_t)
+    # exp(log_w) is the leaf distribution of the value-softmax traversal of sample_from_tree
+    probs, stack = {}, [(s.meta_root, 0.0)]
+    while stack:
+        node, lp = stack.pop()
+        if not node.children:
+            probs[id(node)] = lp
+            continue
+        z = np.array([c.value_est for c in node.children], dtype=np.float64)
+        stack.extend((c, lp + zc) for c, zc in zip(node.children, z - np.logaddexp.reduce(z)))
+    lw = np.array([w for _, w in leaves])
+    np.testing.assert_allclose(np.exp(lw - np.logaddexp.reduce(lw)), np.exp([probs[id(n)] for n, _ in leaves]),
+                               rtol=1e-6, atol=1e-12)
+    assert stats['value_error']['meta']['all']['n'] == stats['n_roots']
+    n_branch_children = sum(len(n.children) for n in nodes if n.t in (80, 60, 40, 20) and len(n.children) > 1)
+    assert sum(v['all']['n'] for k, v in stats['value_error'].items() if k != 'meta') == n_branch_children

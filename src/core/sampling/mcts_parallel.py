@@ -22,6 +22,95 @@ from src.utils.plotting_utils import visualize_dataset_comparison, plot_density_
 from src.evaluation.distribution_metrics import *
     
 
+VISIT_BINS = ((1, 1), (2, 9), (10, 99), (100, 999), (1000, None))
+
+
+def _visit_bin(v):
+    for lo, hi in VISIT_BINS:
+        if v >= lo and (hi is None or v <= hi):
+            return f"{lo}-{hi if hi is not None else 'inf'}"
+
+
+def _summary(values):
+    a = np.asarray(values, dtype=np.float64)
+    return {'n': int(a.size), 'mean': float(a.mean()), 'min': float(a.min()), 'q50': float(np.quantile(a, 0.5)),
+            'q90': float(np.quantile(a, 0.9)), 'q99': float(np.quantile(a, 0.99)), 'max': float(a.max())}
+
+
+def tree_statistics(meta_root, expand_timesteps, child_log_value=None):
+    """Shape and value statistics of a built rollout tree. Read-only: no random numbers, no change to the tree.
+
+    Layers are the meta-root ('meta') and the expansion timesteps below it ('80', '60', ... for the
+    2D schedule); a branch node is a node with at least two children, the meta-root always counts as one.
+    Per layer: node count, branch-node count, histogram of the number of children and summary of the
+    visit counts. Per terminal leaf: the number of branch ancestors below the meta-root (branch depth)
+    and the lowest layer among them. With child_log_value(x [B, d], t [B]) -> log M_t (float64), the
+    value error value_est - log M_t of every child of a branch node, per layer of the parent and per
+    visit-count bin of the child (VISIT_BINS).
+
+    Returns (stats, leaves) with leaves a list of (leaf, log_w): log_w = value_est(leaf) - sum of
+    log n_children over its branch ancestors. With the log-mean-exp backup the traversal of
+    sample_from_tree picks each leaf with probability proportional to exp(log_w)."""
+    layer_ts = [t for t in expand_timesteps if t < meta_root.t]
+    layers = {'meta': {'children': [len(meta_root.children)], 'visits': [meta_root.visit_count], 'nodes': 1}}
+    layers.update({str(t): {'children': [], 'visits': [], 'nodes': 0} for t in layer_ts})
+    depth_hist, lowest_hist = defaultdict(int), defaultdict(int)
+    branch_children = []                                    # (parent layer, child)
+    leaves, nonterminal = [], 0
+    stack = [(meta_root, 0.0, 0, 'none')]
+    while stack:
+        node, log_n, depth, lowest = stack.pop()
+        k = len(node.children)
+        is_meta = node is meta_root
+        if not is_meta and str(node.t) in layers:
+            layers[str(node.t)]['nodes'] += 1
+            layers[str(node.t)]['children'].append(k)
+            layers[str(node.t)]['visits'].append(node.visit_count)
+        if k == 0:
+            if node.t <= 0:
+                leaves.append((node, float(node.value_est) - log_n))
+                depth_hist[depth] += 1
+                lowest_hist[lowest] += 1
+            else:
+                nonterminal += 1
+            continue
+        if k > 1 or is_meta:
+            label = 'meta' if is_meta else str(node.t)
+            branch_children.extend((label, c) for c in node.children)
+            log_n += math.log(k)
+            if not is_meta:
+                depth, lowest = depth + 1, label
+        stack.extend((c, log_n, depth, lowest) for c in node.children)
+
+    stats = {'n_roots': len(meta_root.children), 'n_leaves': len(leaves), 'n_nonterminal_leaves': nonterminal,
+             'leaf_branch_depth': {str(d): n for d, n in sorted(depth_hist.items())},
+             'leaf_lowest_branch_layer': dict(lowest_hist), 'layers': {}}
+    for label, L in layers.items():
+        ch = np.asarray(L['children'])
+        stats['layers'][label] = {
+            'nodes': L['nodes'], 'branch_nodes': int((ch > 1).sum()) if label != 'meta' else 1,
+            'children_hist': {str(c): int(n) for c, n in zip(*np.unique(ch, return_counts=True))} if ch.size else {},
+            'children_of_branch_nodes': _summary(ch[ch > 1]) if (ch > 1).any() else None,
+            'visits': _summary(L['visits']) if L['visits'] else None}
+    if child_log_value is not None and branch_children:
+        x = torch.cat([c.x_t for _, c in branch_children]).double()
+        t = torch.tensor([c.t for _, c in branch_children])
+        log_m = torch.cat([child_log_value(x[i:i + 4096], t[i:i + 4096]) for i in range(0, len(x), 4096)]).numpy()
+        rows = defaultdict(list)
+        for (label, c), lm in zip(branch_children, log_m):
+            err = float(c.value_est) - float(lm)
+            rows[(label, 'all')].append(err)
+            rows[(label, _visit_bin(c.visit_count))].append(err)
+        value_error = defaultdict(dict)
+        for (label, b), e in rows.items():
+            e = np.asarray(e)
+            value_error[label][b] = {'n': int(e.size), 'bias': float(e.mean()),
+                                     'var': float(e.var(ddof=1)) if e.size > 1 else None,
+                                     'rmse': float(np.sqrt(np.mean(e ** 2)))}
+        stats['value_error'] = dict(value_error)
+    return stats, leaves
+
+
 class MCTSNode:
     """
     Each node represents a state x_t at diffusion timestep t.

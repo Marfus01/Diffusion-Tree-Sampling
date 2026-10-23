@@ -10,12 +10,13 @@ import argparse
 from dataclasses import asdict
 import time
 import pickle
+import json
 
 from src.models.diffusion_2d import DiffusionModel
 from src.models.gmm_analytic import GMMInverseProblem, AnalyticGMMDiffusion, GMMTask, sliced_wasserstein
 from src.utils.datasets import get_2d_dataset
 from src.core.config import get_default_toy_config, process_toy_config
-from src.core.sampling.mcts_parallel import MCTSDiffusionSampler
+from src.core.sampling.mcts_parallel import MCTSDiffusionSampler, tree_statistics
 from src.core.sampling.smc_2d import SMCDiffusion2DSampler
 from src.evaluation.distribution_metrics import compute_mmd
 from src.evaluation.value_metrics import evaluate_mcts_value_estimates, evaluate_smc_value_estimates
@@ -101,6 +102,10 @@ def parse_script_args():
     egroup.add_argument('--no_value_eval', action='store_true', help='Disable value function evaluation.')
     egroup.add_argument('--value_timesteps', nargs='+', type=int, help='Timesteps for value evaluation.')
     egroup.add_argument('--no_save_samples', action='store_true', help='Do not save evaluation samples.')
+    egroup.add_argument('--tree_stats', action='store_true',
+                        help='DTS: after every NFE snapshot write the tree statistics of mcts_parallel.tree_statistics '
+                             '(and, for --dataset gmm, value errors against the closed-form log M_t and the exact leaf '
+                             'distribution) to tree_stats_<method>_seed<seed>.json. Read-only, samples are unchanged.')
 
     args = parser.parse_args()
     if args.dataset == 'gmm' and args.gmm_dim is None:
@@ -205,6 +210,26 @@ def dup_ess(samples_np, population_size):
     return float(1.0 / np.sum(w ** 2)) / population_size
 
 
+def snapshot_tree_stats(sampler, diffusion_model, problem):
+    """tree_statistics of the current tree; on the GMM also the value error against the closed-form
+    log M_t and the exact leaf distribution of sample_from_tree (E[r] - E_{pi*_0}[r], mode-mass TV, ESS)."""
+    log_value = None
+    if problem is not None:
+        abar = diffusion_model.alphas_cumprod.double().cpu()
+        log_value = lambda x, t: problem.log_soft_value(x, abar[t])
+    stats, leaves = tree_statistics(sampler.meta_root, sampler.expand_timesteps, log_value)
+    if problem is not None and leaves:
+        x = torch.cat([n.x_t for n, _ in leaves]).float()
+        lw = np.array([w for _, w in leaves])
+        p = np.exp(lw - np.logaddexp.reduce(lw))
+        r = problem.log_likelihood(x).double().cpu().numpy()
+        mass = np.bincount(problem.map_component(x.cpu().numpy()), weights=p, minlength=len(problem.weights))
+        stats['leaf_distribution'] = {'reward_gap': float(p @ r - problem.target_mean_reward()),
+                                      'mode_tv': 0.5 * float(np.abs(mass - problem.posterior_weights).sum()),
+                                      'ess': float(1.0 / np.sum(p ** 2))}
+    return stats
+
+
 def make_mcts_sampler(config, args, diffusion_model, reward_np, use_rollout):
     eps_init = args.eps_explore if args.eps_explore is not None else 0.1
     eps_final = args.eps_explore if args.eps_explore is not None else 0.05
@@ -242,6 +267,7 @@ def run_mcts(config, args, dataset_name, diffusion_model, task, problem, reward,
     mcts_sampler.initialize_root_nodes()
     reset_peak_memory()
     build_time, build_reward_evals = 0.0, 0
+    tree_stats = []
 
     for target_nfes in config.sampling.compute_budget:
         reward.reset()
@@ -269,6 +295,14 @@ def run_mcts(config, args, dataset_name, diffusion_model, task, problem, reward,
         nodes_by_timestep_all_iters[target_nfes] = nodes_by_timestep
         logger.info(f"  {method_name} NFE {target_nfes} (actual {mcts_sampler.nfes}): " +
                     ", ".join(f"{k}={v:.4g}" for k, v in m.items() if isinstance(v, (float, np.floating))))
+        if args.tree_stats:
+            t2 = time.time()
+            st = snapshot_tree_stats(mcts_sampler, diffusion_model, problem)
+            tree_stats.append({'NFEs': target_nfes, 'ActualNFEs': mcts_sampler.nfes, 'BuildTime': build_time,
+                               'StatsTime': time.time() - t2, **st})
+            logger.info(f"  tree: roots {st['n_roots']}, leaves {st['n_leaves']}, branch depth {st['leaf_branch_depth']}")
+            Path(config.paths.metrics_dir, f"tree_stats_{method_name}_seed{config.common.seed}.json").write_text(
+                json.dumps(tree_stats, indent=1))
 
     if config.eval.evaluate_value:
         for target_nfes in config.sampling.compute_budget:
