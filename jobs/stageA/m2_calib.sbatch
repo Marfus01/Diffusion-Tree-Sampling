@@ -3,6 +3,7 @@
 #SBATCH -p gpu_a800
 #SBATCH --gpus=1
 #SBATCH --time=03:00:00
+#SBATCH --exclude=d1n41a14g01
 #SBATCH -o logs/%x_%A_%a.out
 #SBATCH -e logs/%x_%A_%a.err
 # A-R006 calibration on the calibration class. CONFIGS is a file of lines "label|run_img flags[|seeds]";
