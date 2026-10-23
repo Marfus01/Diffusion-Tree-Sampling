@@ -318,6 +318,7 @@ class SDFKDConfig(BaseFKDConfig):
     resampling_t_end: int = 40
     reward_min_val: float = 0.0 # Updated in processing
     batch_size: int = 20 # FKD internal batch size
+    cfg_pairing: str = "fixed" # "upstream" reproduces upstream's CFG embedding order (see run_sd --cfg_pairing)
 
 
 @dataclass

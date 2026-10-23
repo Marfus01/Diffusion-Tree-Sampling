@@ -94,6 +94,11 @@ def parse_script_args():
                         help='Widening exponent of the non-root nodes of DTS/DTS* (code value 0.4; paper 0.8).')
     sgroup.add_argument('--adaptive_resampling', type=lambda v: v.lower() in ('1', 'true', 'yes'),
                         help='ESS-adaptive resampling for FK (true/false).')
+    sgroup.add_argument('--cfg_pairing', choices=['fixed', 'upstream'], default='fixed',
+                        help="FK / FK-max CFG embedding order. 'fixed': [u_0..u_{B-1}, c_0..c_{B-1}], matching the UNet "
+                             "input cat([latents] * 2). 'upstream': the interleaved [u_0, c_0, u_1, c_1, ...] slice of "
+                             "upstream DTS, under which the CFG difference vanishes and even / odd particles in a batch "
+                             "are denoised unconditionally / conditionally (ablation only).")
 
     args = parser.parse_args()
     config = get_default_sd_config()
@@ -125,6 +130,7 @@ def parse_script_args():
     if args.no_compile: os.environ["DTS_NO_COMPILE"] = "1"
     if args.base_dir is not None: config.common.base_dir = args.base_dir
     if args.adaptive_resampling is not None: config.fkd.adaptive_resampling = args.adaptive_resampling
+    config.fkd.cfg_pairing = args.cfg_pairing
 
 
     if args.compute_budget is not None:
@@ -366,6 +372,7 @@ def run_fkd(config, prompt, reward_name, pipeline):
         "device": config.common.device,
         "use_rollout": config.fkd.use_rollout,
         "batch_size": config.fkd.batch_size,
+        "cfg_pairing": config.fkd.cfg_pairing,
     }
     nfe_per_particle = config.sampling.num_inference_steps
     if config.fkd.use_rollout:

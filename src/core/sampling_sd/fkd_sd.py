@@ -18,6 +18,22 @@ class SDSMCOutput:
     nfes: int
 
 
+def cfg_batch_prompt_embeds(prompt_embeds_population, start, end, cfg_pairing="fixed"):
+    """Encoder hidden states for particles [start, end) under CFG, paired with the UNet input cat([latents] * 2).
+
+    prompt_embeds_population interleaves [u_0, c_0, u_1, c_1, ...] (u: negative / unconditional, c: prompt).
+    'fixed' returns [u_start..u_{end-1}, c_start..c_{end-1}], so each latent sees u in the first half and c
+    in the second. 'upstream' reproduces the slice of upstream DTS (prompt_embeds_population[2*start:2*end]):
+    for an even batch both halves then carry the same alternating u, c, ..., the CFG difference is zero and
+    particle i is denoised with u if i is even and with c if i is odd (an effective guidance scale of 1)."""
+    if cfg_pairing == "upstream":
+        return prompt_embeds_population[start * 2: end * 2]
+    if cfg_pairing != "fixed":
+        raise ValueError(f"unknown cfg_pairing {cfg_pairing!r}")
+    return torch.cat([prompt_embeds_population[start * 2: end * 2: 2],
+                      prompt_embeds_population[start * 2 + 1: end * 2: 2]])
+
+
 class PotentialType(Enum):
     DIFF = "diff"
     MAX = "max"
@@ -502,6 +518,7 @@ class FKDStableDiffusion(
         timestep_cond: Optional[torch.Tensor] = None,
         cross_attention_kwargs: Optional[Dict] = None,
         use_progress_bar: bool = False,
+        cfg_pairing: str = "fixed",
     ) -> torch.Tensor:
         """
         Performs DDIM rollouts in batches from given starting latent states and timestep index.
@@ -542,11 +559,7 @@ class FKDStableDiffusion(
             # Adapt prompt_embeds for the current batch size if necessary
             # prompt_embeds should be [num_particles*2, seq, dim] if CFG, or [num_particles, seq, dim] if no CFG
             if do_classifier_free_guidance:
-                # For CFG, we need to slice both unconditional and conditional embeddings
-                # prompt_embeds layout: [uncond_0, cond_0, uncond_1, cond_1, ...]
-                # reorder the interleaved [u_i, c_i] pairs to match cat([latents] * 2)
-                current_batch_prompt_embeds = torch.cat([prompt_embeds[batch_start_idx*2 : batch_end_idx*2 : 2],
-                                                         prompt_embeds[batch_start_idx*2 + 1 : batch_end_idx*2 : 2]])
+                current_batch_prompt_embeds = cfg_batch_prompt_embeds(prompt_embeds, batch_start_idx, batch_end_idx, cfg_pairing)
             else:
                 current_batch_prompt_embeds = prompt_embeds[batch_start_idx:batch_end_idx]
             
@@ -1227,6 +1240,7 @@ class FKDStableDiffusion(
         else:
             raise NotImplementedError(f"potential_type {potential_type.value} is not implemented for batched SMC.")
         use_rollout = fkd_args.get("use_rollout", False)
+        cfg_pairing = fkd_args.get("cfg_pairing", "fixed")
         self.nfes = 0
         self.reward_evals = 0
 
@@ -1245,13 +1259,9 @@ class FKDStableDiffusion(
                     batch_end_idx = min(batch_start_idx + processing_batch_size, num_particles)
                     current_latents_batch = latents[batch_start_idx:batch_end_idx]
                     
-                    # Slice prompt embeds: each particle has 2 (uncond, cond)
-                    # prompt_embeds_population interleaves [u_0, c_0, u_1, c_1, ...]; the UNet input is
-                    # cat([latents] * 2), so the embeddings must be [u_0..u_{B-1}, c_0..c_{B-1}]
-                    current_prompt_embeds_batch = torch.cat([
-                        prompt_embeds_population[batch_start_idx*2 : batch_end_idx*2 : 2],
-                        prompt_embeds_population[batch_start_idx*2 + 1 : batch_end_idx*2 : 2],
-                    ]) if self.do_classifier_free_guidance else prompt_embeds_population[batch_start_idx:batch_end_idx]
+                    current_prompt_embeds_batch = cfg_batch_prompt_embeds(
+                        prompt_embeds_population, batch_start_idx, batch_end_idx, cfg_pairing,
+                    ) if self.do_classifier_free_guidance else prompt_embeds_population[batch_start_idx:batch_end_idx]
 
                     current_added_cond_kwargs_batch = {}
                     if "image_embeds" in added_cond_kwargs and added_cond_kwargs["image_embeds"] is not None:
@@ -1318,6 +1328,7 @@ class FKDStableDiffusion(
                             timestep_cond=timestep_cond, # Pass population timestep_cond
                             cross_attention_kwargs=self.cross_attention_kwargs,
                             use_progress_bar=use_rollout_progress_bar,
+                            cfg_pairing=cfg_pairing,
                         )
                         logger.info(f"Batched rollouts complete for step {i}.")
                         self.nfes += num_particles * (len(timesteps) - i)
