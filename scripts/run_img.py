@@ -346,7 +346,8 @@ def run_smc(config, args, run_class_name, target_class_list, classifier,
             inception_model, real_loader, pipeline, method_name="SMC"):
     """Runs SMC/FK, DPS-RG ('Guidance'), TDS ('SMC-Guidance'), DAS ('SMC-Guidance-Tempering') or
     SMC-Rollout. Every NFE point is a separate run with K = NFE // (NFE per particle) particles;
-    SMC methods draw the population_size evaluation images with replacement by their final weights."""
+    SMC methods draw the population_size evaluation images with replacement by their final weights,
+    DPS-RG uniformly with replacement."""
     logger.info(f"--- Running {method_name} for {run_class_name} ---")
     metrics_data = {}
 
@@ -414,8 +415,6 @@ def run_smc(config, args, run_class_name, target_class_list, classifier,
         particles = out.images
         if use_smc:
             idx = torch.multinomial(torch.softmax(out.log_weights.double(), dim=0), n_eval, replacement=True)
-        elif n_particles >= n_eval:
-            idx = torch.randperm(n_particles, device=particles.device)[:n_eval]
         else:
             idx = torch.randint(0, n_particles, (n_eval,), device=particles.device)
         eval_samples = particles[idx.to(particles.device)]
