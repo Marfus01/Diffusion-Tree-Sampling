@@ -21,6 +21,7 @@ mkdir -p $S
 echo "upstream $(git -C $UP rev-parse HEAD)  repro-m2 $(git -C $M2 rev-parse HEAD)"
 T="python jobs/stageA/m4_smc_equiv.py"
 C="--classifier_path $CLF --device cuda --deterministic"
+if [ "${SKIP_UNIT:-0}" != 1 ]; then
 $T run --code_root $UP --side upstream --out $S/up.pt --base_dir $S/b_up $C > $S/up.log 2>&1 &
 $T run --code_root $DTS_CODE --side fork --smc_impl upstream --out $S/fu.pt --base_dir $S/b_fu $C > $S/fu.log 2>&1 &
 $T run --code_root $M2 --side fork --frozen_das_gamma 0.0142 --out $S/m2.pt --base_dir $S/b_m2 $C > $S/m2.log 2>&1 &
@@ -31,9 +32,10 @@ echo "== upstream checkout vs --smc_impl upstream"
 $T compare $S/up.pt $S/fu.pt || true
 echo "== repro-m2 vs --smc_impl fixed"
 $T compare $S/m2.pt $S/ff.pt || true
+fi
 
 # run_img end to end, default implementation, in both worktrees
-F="--dataset cifar10 --sample_classes 1 --compute_budget 5000 --population_size 200 --seed 0 --no_progress_bar --do_smc --do_smc_guidance --do_smc_guidance_tempering --adaptive_resampling true"
+F="--dataset cifar10 --sample_classes 1 --compute_budget 5000 --population_size 200 --seed 0 --no_progress_bar --do_smc --do_smc_guidance --do_smc_guidance_tempering --adaptive_resampling true --classifier_model resnet18_cifar10_edadaltocg --classifier_path $DTS_ROOT/scratch/classifiers/edadaltocg_resnet18_cifar10/pytorch_model.bin"
 for w in m2:$M2 m4:$DTS_CODE; do
   n=${w%%:*}; d=${w#*:}
   (cd $d && python -m scripts.run_img $F --base_dir $S/cli_$n --exp_name e2e > $S/cli_$n.log 2>&1) &

@@ -1,0 +1,10 @@
+# A-R010 method x hyperparameter sets (H). paper: DTS paper SS F, resampling at steps 10, 20, 30, 40
+# with adaptive resampling, TDS and DAS scale 1, DAS gamma 0.008 (upstream constant). frozen: M2 frozen
+# configurations (m2_frozen_smc.txt). Implementation I (--smc_impl) and classifier K are added by
+# m4_par.sbatch.
+FK-paper|--do_smc --adaptive_resampling true
+FK-frozen|--do_smc --adaptive_resampling false
+TDS-paper|--do_smc_guidance --guidance_scale 1 --adaptive_resampling true
+TDS-frozen|--do_smc_guidance --guidance_scale 0.5 --adaptive_resampling false
+DAS-paper|--do_smc_guidance_tempering --guidance_scale 1 --das_gamma 0.008 --adaptive_resampling true
+DAS-frozen|--do_smc_guidance_tempering --guidance_scale 0.5 --das_gamma 0.0142 --resampling_steps 0 49 1 --adaptive_resampling false
