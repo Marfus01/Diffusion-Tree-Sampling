@@ -11,6 +11,7 @@
 #   max:  FK-max (max potential, lambda=10, best final particle)
 #   dts:  DTS alone (e.g. with SD_EXTRA="--pw_alpha 0.8")
 # then the offline metrics of eval/eval_sd.py. Submit with --array=0..(#words - 1) and --time.
+# Run directories are geneval_sub20_${PREFIX}_${STAGE}_t<task>_<variant> (PREFIX defaults to m3).
 set -euo pipefail
 export DTS_CODE=${DTS_CODE:-$HOME/run/dts/wt-m3}
 source $DTS_CODE/jobs/stageA/env.sh
@@ -35,16 +36,17 @@ trap 'rm -rf $TMPDIR' EXIT
 COMMON="--prompts_file $PROMPTS --prompt_ids $IDS --sd_model_id stable-diffusion-v1-5/stable-diffusion-v1-5 \
   --guiding_reward_fns ImageReward --compute_budget $NFE --population_size 16 --seed 0 --no_progress_bar \
   --base_dir $DTS_BASE_DIR ${SD_EXTRA:-}"
+PREFIX=${PREFIX:-m3}
 TAG=${STAGE}_t${SLURM_ARRAY_TASK_ID}
 echo "[$(date)] stage=$STAGE prompts=[$IDS] variants=[$VARIANTS] nfe=[$NFE]"
 
 for V in $VARIANTS; do
   echo "[$(date)] variant $V"
   case $V in
-    main) python -m scripts.run_sd $COMMON --do_bon --do_fkd --do_mcts_rollout --exp_name m3_${TAG}_main ;;
-    star) python -m scripts.run_sd $COMMON --do_mcts_rollout --maximize --exp_name m3_${TAG}_star ;;
-    max)  python -m scripts.run_sd $COMMON --do_fkd --potential_type max --lambda 10 --exp_name m3_${TAG}_max ;;
-    dts)  python -m scripts.run_sd $COMMON --do_mcts_rollout --exp_name m3_${TAG}_dts ;;
+    main) python -m scripts.run_sd $COMMON --do_bon --do_fkd --do_mcts_rollout --exp_name ${PREFIX}_${TAG}_main ;;
+    star) python -m scripts.run_sd $COMMON --do_mcts_rollout --maximize --exp_name ${PREFIX}_${TAG}_star ;;
+    max)  python -m scripts.run_sd $COMMON --do_fkd --potential_type max --lambda 10 --exp_name ${PREFIX}_${TAG}_max ;;
+    dts)  python -m scripts.run_sd $COMMON --do_mcts_rollout --exp_name ${PREFIX}_${TAG}_dts ;;
   esac
 done
 
@@ -55,7 +57,7 @@ fi
 
 if [ "$EVAL" = 1 ]; then
   for V in $VARIANTS; do
-    RUN=$DTS_BASE_DIR/sd/geneval_sub20_m3_${TAG}_$V
+    RUN=$DTS_BASE_DIR/sd/geneval_sub20_${PREFIX}_${TAG}_$V
     echo "[$(date)] offline metrics $RUN"
     python -m eval.eval_sd --image_dir $RUN/images/ImageReward --prompts_file $PROMPTS \
       --out $RUN/metrics/offline_eval.csv
