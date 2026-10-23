@@ -1,0 +1,9 @@
+# A-R006 recheck at 1e6 NFE, seed 0: best and second of each method's last calibrated item at 1e5.
+FK__branch-adaF|--do_smc --adaptive_resampling false
+FK__every-adaT|--do_smc --resampling_steps 0 49 1 --adaptive_resampling true
+DPS-RG__s8|--do_guidance --guidance_scale 8
+DPS-RG__s4|--do_guidance --guidance_scale 4
+TDS__s0.5|--do_smc_guidance --guidance_scale 0.5
+TDS__s0.5-every-adaT|--do_smc_guidance --guidance_scale 0.5 --resampling_steps 0 49 1 --adaptive_resampling true
+DAS__g0.0142-every-adaF|--do_smc_guidance_tempering --guidance_scale 0.5 --das_gamma 0.0142 --resampling_steps 0 49 1 --adaptive_resampling false
+DAS__g0.0142-every-adaT|--do_smc_guidance_tempering --guidance_scale 0.5 --das_gamma 0.0142 --resampling_steps 0 49 1 --adaptive_resampling true

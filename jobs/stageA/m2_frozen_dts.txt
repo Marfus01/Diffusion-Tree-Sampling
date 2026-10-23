@@ -1,0 +1,2 @@
+# A-R007 DTS: alpha = 0.8, C = 2 (hard-coded in mcts_img.py), epsilon 0, tree batch 1.
+DTS|--do_mcts_rollout --mcts_batch_size 1
