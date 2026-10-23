@@ -97,6 +97,9 @@ def parse_script_args():
     sgroup.add_argument('--pw_alpha_root', type=float, help='DTS progressive-widening alpha of the meta-root only.')
     sgroup.add_argument('--eps_explore', type=float, help='Constant epsilon for DTS tree construction (default: linear 0.1 -> 0.05).')
     sgroup.add_argument('--mcts_batch_size', type=int, help='DTS internal batch size.')
+    sgroup.add_argument('--compact_tree', action='store_true',
+                        help='DTS: drop the states of rollout-chain nodes that are never read again '
+                             '(MCTSDiffusionSampler keep_chain_states=False); same tree and samples, less memory.')
 
     egroup = parser.add_argument_group('Evaluation Overrides')
     egroup.add_argument('--no_value_eval', action='store_true', help='Disable value function evaluation.')
@@ -253,6 +256,7 @@ def make_mcts_sampler(config, args, diffusion_model, reward_np, use_rollout):
         visualization_timesteps=list(config.mcts.expand_timesteps + [0]),
         pw_alpha=args.pw_alpha,
         pw_alpha_root=args.pw_alpha_root,
+        keep_chain_states=not args.compact_tree,
     )
 
 

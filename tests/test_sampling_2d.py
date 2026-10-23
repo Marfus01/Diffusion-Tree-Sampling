@@ -185,12 +185,13 @@ def test_diverging_guidance_is_reported_not_masked():
     assert torch.isfinite(out['log_weights']).all() and torch.isfinite(out['samples']).all()
 
 
-def _grow(model, problem, with_stats, budgets=(2_000, 6_000)):
+def _grow(model, problem, with_stats, budgets=(2_000, 6_000), keep_chain_states=True):
     torch.manual_seed(0)
     random.seed(0)
     s = MCTSDiffusionSampler(model, reward_fn=lambda x: problem.log_likelihood(x).numpy(),
                              expand_timesteps=[100, 80, 60, 40, 20], num_nfes=max(budgets), device='cpu',
-                             use_progress_bar=False, use_rollout=True, batch_size=1, pw_alpha=0.3, pw_alpha_root=0.4)
+                             use_progress_bar=False, use_rollout=True, batch_size=1, pw_alpha=0.3, pw_alpha_root=0.4,
+                             keep_chain_states=keep_chain_states)
     s.initialize_root_nodes()
     out, stats = [], None
     abar = model.alphas_cumprod.double()
@@ -199,13 +200,13 @@ def _grow(model, problem, with_stats, budgets=(2_000, 6_000)):
         if with_stats:
             stats = tree_statistics(s.meta_root, s.expand_timesteps, lambda x, t: problem.log_soft_value(x, abar[t]))
         out.append(s.sample_from_tree(500)[0])
-    return s, out, stats
+    return s, out, (stats, s.nfes)
 
 
 def test_tree_statistics_is_read_only_and_matches_traversal(gmm2):
     problem, model = gmm2
     _, plain, _ = _grow(model, problem, with_stats=False)
-    s, logged, (stats, leaves) = _grow(model, problem, with_stats=True)
+    s, logged, ((stats, leaves), _) = _grow(model, problem, with_stats=True)
     for a, b in zip(plain, logged):
         assert torch.equal(a, b)
     nodes = tree_nodes(s.meta_root)
@@ -232,3 +233,15 @@ def test_tree_statistics_is_read_only_and_matches_traversal(gmm2):
     assert stats['value_error']['meta']['all']['n'] == stats['n_roots']
     n_branch_children = sum(len(n.children) for n in nodes if n.t in (80, 60, 40, 20) and len(n.children) > 1)
     assert sum(v['all']['n'] for k, v in stats['value_error'].items() if k != 'meta') == n_branch_children
+
+
+def test_compact_tree_keeps_tree_and_samples(gmm2):
+    problem, model = gmm2
+    s_full, full, ((st_full, _), nfe_full) = _grow(model, problem, with_stats=True)
+    s_comp, comp, ((st_comp, _), nfe_comp) = _grow(model, problem, with_stats=True, keep_chain_states=False)
+    assert nfe_full == nfe_comp
+    for a, b in zip(full, comp):
+        assert torch.equal(a, b)
+    assert st_full == st_comp
+    dropped = [n for n in tree_nodes(s_comp.meta_root) if n.x_t is None]
+    assert dropped and all(n.t not in (80, 60, 40, 20, 79, 59, 39, 19, 99) for n in dropped)

@@ -194,7 +194,8 @@ class MCTSDiffusionSampler:
                  visualization_timesteps: list = None,
                  dims: int = None,
                  pw_alpha: float = None,
-                 pw_alpha_root: float = None):
+                 pw_alpha_root: float = None,
+                 keep_chain_states: bool = True):
         """
         Args:
           diffusion_model: Pretrained diffusion model providing:
@@ -219,6 +220,10 @@ class MCTSDiffusionSampler:
             the original hard-coded values (0.3 for nodes and 0.4 for the meta-root with rollouts,
             0.4 for both without).
           pw_alpha_root: Exponent for the meta-root only; overrides pw_alpha there.
+          keep_chain_states: False drops x_t and the cached noise_pred of rollout-chain nodes once their
+            child exists, except at the expansion timesteps, directly below them and at t = T - 1 (the
+            states that expansion, sampling and tree_statistics read). Chain nodes elsewhere are never
+            expanded, so the tree, the NFE count and the samples are unchanged; memory per node drops.
 
         Node values are stored in log space: value_est = log M_hat, the soft backup is
         log-mean-exp over children, and selection samples children with probability
@@ -247,6 +252,7 @@ class MCTSDiffusionSampler:
         self.dims = dims if dims is not None else diffusion_model.input_dim
         self.pw_alpha = pw_alpha
         self.pw_alpha_root = pw_alpha_root
+        self.keep_chain_states = keep_chain_states
         self.output_dir = output_dir
         self.visualization_timesteps = visualization_timesteps if visualization_timesteps is not None else []
 
@@ -280,6 +286,9 @@ class MCTSDiffusionSampler:
         self.meta_root = MetaRootNode(self)
         return self.meta_root
     
+    def _state_is_read(self, t):
+        return t in self.expand_timesteps or (t + 1) in self.expand_timesteps or t == self.num_timesteps - 1
+
     def _is_meta_root(self, node):
         return node.t >= self.num_timesteps
     
@@ -720,7 +729,9 @@ class MCTSDiffusionSampler:
                     child_x_tm1 = x_tm1_batch[i:i+1]
                     next_node_in_rollout = MCTSNode(child_x_tm1, t - 1, parent=parent_node_in_rollout)
                     parent_node_in_rollout.children.append(next_node_in_rollout)
-                    if self.cache_noise_pred:
+                    if not self.keep_chain_states and not self._state_is_read(t):
+                        parent_node_in_rollout.x_t = None
+                    elif self.cache_noise_pred:
                         parent_node_in_rollout.noise_pred = noise_pred_batch[i:i+1]
 
                     if next_node_in_rollout.t <= 0:
