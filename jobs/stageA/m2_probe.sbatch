@@ -30,5 +30,5 @@ echo "[$(date)] SMC/FK and TDS"
 python -m scripts.run_img $COMMON --do_smc --do_smc_guidance --compute_budget 10000 100000 --exp_name m2_probe_smc
 
 echo "[$(date)] offline evaluation"
-python -m eval.eval_cifar --run_dir $RES/subset_m2_probe_smc --data_path $DTS_DATA_DIR
+python -m eval.eval_cifar --run_dir $RES/0_m2_probe_smc --data_path $DTS_DATA_DIR
 echo "[$(date)] done"
