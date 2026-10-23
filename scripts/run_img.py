@@ -267,10 +267,14 @@ def save_eval_samples(images, path):
     np.savez_compressed(path, images=arr)
 
 
+def samples_path(config, method_name, run_class_name, target_nfes):
+    return Path(config.paths.metrics_dir) / f"samples_{method_name}_{run_class_name}_N{target_nfes}.npz"
+
+
 def finish_nfe_point(images, metrics, method_name, run_class_name, target_nfes, output_dir, config, args):
     metrics['Distinct'] = distinct_count(images)
     if not args.no_save_samples:
-        save_eval_samples(images, Path(config.paths.metrics_dir) / f"samples_{method_name}_{run_class_name}_N{target_nfes}.npz")
+        save_eval_samples(images, samples_path(config, method_name, run_class_name, target_nfes))
     grid = images[torch.randperm(images.shape[0])[:config.sampling.gen_batch_size]] if images.shape[0] > config.sampling.gen_batch_size else images
     grid = (grid / 2 + 0.5).clamp(0, 1)
     save_image(grid.cpu(), output_dir / f"{run_class_name}_{target_nfes}.png", nrow=int(math.ceil(np.sqrt(grid.shape[0]))))
@@ -409,6 +413,7 @@ def run_smc(config, args, run_class_name, target_class_list, classifier,
             logger.error(f"  {method_name} NFE {nfe_target} ({n_particles} particles): {e}")
             metrics_data[nfe_target] = {'NFEs': nfe_target, 'ActualParticles': n_particles, 'Diverged': 1,
                                         'Time': time.time() - t0}
+            samples_path(config, method_name, run_class_name, nfe_target).unlink(missing_ok=True)   # stale file of an earlier run
             continue
         if torch.cuda.is_available(): torch.cuda.synchronize()
         run_time = time.time() - t0
