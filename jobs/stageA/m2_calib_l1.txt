@@ -1,9 +1,8 @@
 # A-R006 layer 1 (label|run_img flags[|seeds]). Lines are dealt round-robin to the array tasks, so the
-# four long DTS lines come first, one per task.
+# long DTS lines come first, one per task.
 DTS__bs1|--do_mcts_rollout --mcts_batch_size 1
-DTS__bs1-recompute|--do_mcts_rollout --mcts_batch_size 1 --sibling_recompute|0
 DTS__bs16|--do_mcts_rollout --mcts_batch_size 16
-DTS__bs64|--do_mcts_rollout --mcts_batch_size 64
+DTS__bs1-recompute|--do_mcts_rollout --mcts_batch_size 1 --sibling_recompute|0
 FK__branch-adaF|--do_smc --adaptive_resampling false
 FK__branch-adaT|--do_smc --adaptive_resampling true
 FK__every-adaF|--do_smc --resampling_steps 0 49 1 --adaptive_resampling false
