@@ -91,14 +91,15 @@ def main():
 
     from pytorch_fid.inception import InceptionV3
     from pytorch_fid.fid_score import calculate_frechet_distance
-    from transformers import CLIPModel, CLIPProcessor, AutoImageProcessor, AutoModelForImageClassification
+    # The concrete ConvNeXt classes: the Auto classes import timm_wrapper, which needs timm >= 1.0.
+    from transformers import CLIPModel, CLIPProcessor, ConvNextImageProcessor, ConvNextForImageClassification
 
     device = args.device
     inception = InceptionV3([InceptionV3.BLOCK_INDEX_BY_DIM[2048]]).to(device).eval()
     clip_model = CLIPModel.from_pretrained(args.clip_model).to(device).eval()
     clip_proc = CLIPProcessor.from_pretrained(args.clip_model)
-    held_proc = AutoImageProcessor.from_pretrained(args.heldout_model)
-    held_model = AutoModelForImageClassification.from_pretrained(args.heldout_model).to(device).eval()
+    held_proc = ConvNextImageProcessor.from_pretrained(args.heldout_model)
+    held_model = ConvNextForImageClassification.from_pretrained(args.heldout_model).to(device).eval()
 
     files = sorted((Path(args.run_dir) / 'metrics').glob('samples_*.npz'))
     real_cache = {}
