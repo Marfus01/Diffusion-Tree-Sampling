@@ -1,6 +1,7 @@
 """Offline metrics for saved CIFAR-10 evaluation samples (run_img.py samples_*.npz).
 
-For each samples_<method>_<class>_N<nfe>.npz in --run_dir/metrics:
+For each samples_<method>_<class>_N<nfe>.npz in <run_dir>/metrics of every --run_dir (models and
+real-image features are loaded once), written to <run_dir>/metrics/offline_eval.csv:
   FID2048   Inception-v3 pool features (pytorch-fid), real set = the class's test images
             without augmentation;
   CMMD      MMD with a Gaussian kernel (sigma = 10, x1000) on L2-normalized CLIP ViT-L/14-336px
@@ -98,16 +99,14 @@ def heldout_accuracy(images_u8, class_idx, model, processor, device):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--run_dir', required=True)
+    parser.add_argument('--run_dir', required=True, nargs='+')
     parser.add_argument('--data_path', required=True, help='torchvision CIFAR-10 root')
     parser.add_argument('--clip_model', default='openai/clip-vit-large-patch14-336')
     parser.add_argument('--heldout_model', default='ahsanjavid/convnext-tiny-finetuned-cifar10')
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
-    parser.add_argument('--out', default=None)
     args = parser.parse_args()
 
     from pytorch_fid.inception import InceptionV3
-    from pytorch_fid.fid_score import calculate_frechet_distance
     # The concrete ConvNeXt classes: the Auto classes import timm_wrapper, which needs timm >= 1.0.
     from transformers import CLIPModel, CLIPProcessor, ConvNextImageProcessor, ConvNextForImageClassification
 
@@ -118,16 +117,24 @@ def main():
     held_proc = ConvNextImageProcessor.from_pretrained(args.heldout_model)
     held_model = ConvNextForImageClassification.from_pretrained(args.heldout_model).to(device).eval()
 
-    files = sorted((Path(args.run_dir) / 'metrics').glob('samples_*.npz'))
     real_cache = {}
+    for run_dir in args.run_dir:
+        rows = evaluate_run(Path(run_dir), real_cache, args.data_path, inception, clip_model, clip_proc, held_model, held_proc, device)
+        out = Path(run_dir) / 'metrics' / 'offline_eval.csv'
+        pd.DataFrame(rows).to_csv(out, index=False)
+        print(f"wrote {out}", flush=True)
+
+
+def evaluate_run(run_dir, real_cache, data_path, inception, clip_model, clip_proc, held_model, held_proc, device):
+    from pytorch_fid.fid_score import calculate_frechet_distance
     rows = []
-    for f in files:
+    for f in sorted((run_dir / 'metrics').glob('samples_*.npz')):
         m = PATTERN.match(f.name)
         if m is None:
             continue
         class_idx = int(m['run_class'].split('_')[1])
         if class_idx not in real_cache:
-            real = load_real(args.data_path, class_idx)
+            real = load_real(data_path, class_idx)
             fr = inception_features(real, inception, device)
             real_cache[class_idx] = (np.mean(fr, 0), np.cov(fr, rowvar=False), clip_embeddings(real, clip_model, clip_proc, device))
         mu_r, sig_r, clip_r = real_cache[class_idx]
@@ -143,9 +150,7 @@ def main():
             'Distinct': int(np.unique(fake.reshape(len(fake), -1).numpy(), axis=0).shape[0]),
         })
         print(rows[-1], flush=True)
-    out = args.out or str(Path(args.run_dir) / 'metrics' / 'offline_eval.csv')
-    pd.DataFrame(rows).to_csv(out, index=False)
-    print(f"wrote {out}")
+    return rows
 
 
 if __name__ == '__main__':
