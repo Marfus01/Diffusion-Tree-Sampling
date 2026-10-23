@@ -39,12 +39,34 @@ def inception_features(images_u8, model, device, batch=250):
     return torch.cat(feats).numpy()
 
 
+def preprocess(images_u8, resize, crop, mean, std, device):
+    """GPU version of the HF image processors for square uint8 [N, 3, H, W] images: bicubic resize
+    to resize x resize, center crop to crop x crop, normalization. It differs from the PIL path by
+    the bicubic kernel (a = -0.75 against -0.5) and by skipping the uint8 rounding after resizing."""
+    x = images_u8.to(device).float() / 255.0
+    x = F.interpolate(x, size=(resize, resize), mode='bicubic', align_corners=False).clamp(0, 1)
+    o = (resize - crop) // 2
+    x = x[..., o:o + crop, o:o + crop]
+    mean = torch.tensor(mean, device=device).view(1, 3, 1, 1)
+    std = torch.tensor(std, device=device).view(1, 3, 1, 1)
+    return (x - mean) / std
+
+
+def clip_inputs(images_u8, processor, device):
+    p = processor.image_processor
+    return preprocess(images_u8, p.size['shortest_edge'], p.crop_size['height'], p.image_mean, p.image_std, device)
+
+
+def convnext_inputs(images_u8, processor, device):
+    crop = processor.size['shortest_edge']          # < 384: resize to crop / crop_pct, then center crop
+    return preprocess(images_u8, int(crop / processor.crop_pct), crop, processor.image_mean, processor.image_std, device)
+
+
 @torch.no_grad()
 def clip_embeddings(images_u8, model, processor, device, batch=250):
     out = []
     for b in range(0, len(images_u8), batch):
-        inputs = processor(images=list(images_u8[b:b + batch].permute(0, 2, 3, 1).numpy()), return_tensors="pt").to(device)
-        e = model.get_image_features(**inputs)
+        e = model.get_image_features(pixel_values=clip_inputs(images_u8[b:b + batch], processor, device))
         out.append(F.normalize(e.float(), dim=-1).cpu())
     return torch.cat(out).double()
 
@@ -73,8 +95,7 @@ def clip_diversity(e, max_pairs=10_000, seed=0):
 def heldout_accuracy(images_u8, class_idx, model, processor, device, batch=250):
     correct = 0
     for b in range(0, len(images_u8), batch):
-        inputs = processor(images=list(images_u8[b:b + batch].permute(0, 2, 3, 1).numpy()), return_tensors="pt").to(device)
-        pred = model(**inputs).logits.argmax(-1)
+        pred = model(pixel_values=convnext_inputs(images_u8[b:b + batch], processor, device)).logits.argmax(-1)
         correct += int((pred == class_idx).sum())
     return correct / len(images_u8)
 
