@@ -1,4 +1,5 @@
 from pathlib import Path
+import copy
 import logging
 
 import torch
@@ -171,7 +172,7 @@ def train_classifier(model, config, patience=20, epochs=100, device='cpu'):
             valid_acc /= len(valid_loader)
 
             if best_acc is None or best_acc < valid_acc:
-                best_params = model.module.state_dict()
+                best_params = copy.deepcopy(model.module.state_dict())   # state_dict tensors alias the live weights
                 best_epoch = epoch
                 best_acc = valid_acc
                 patience_lv = 0
