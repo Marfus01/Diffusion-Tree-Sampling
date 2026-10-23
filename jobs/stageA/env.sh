@@ -9,6 +9,6 @@ export DTS_DATA_DIR=$DTS_ROOT/data/torchvision
 export DTS_BASE_DIR=$DTS_ROOT/experiments
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 export PYTHONUNBUFFERED=1
-cd $DTS_ROOT/Diffusion-Tree-Sampling
+cd ${DTS_CODE:-$DTS_ROOT/Diffusion-Tree-Sampling}
 echo "[$(date)] host=$(hostname) commit=$(git rev-parse HEAD) dirty=$(git status --porcelain --untracked-files=no | wc -l) job=${SLURM_JOB_ID:-none}"
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
