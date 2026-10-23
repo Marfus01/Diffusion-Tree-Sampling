@@ -49,7 +49,7 @@ def generate(a):
 
     out = Path(a.pool_dir)
     out.mkdir(parents=True, exist_ok=True)
-    device = a.device
+    device = torch.device(a.device)
     pipe = DDIMPipeline.from_pretrained(a.model)
     unet = pipe.unet.to(device).eval()
     scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
