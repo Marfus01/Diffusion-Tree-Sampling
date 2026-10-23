@@ -115,7 +115,10 @@ class MCTSNode:
     """
     Each node represents a state x_t at diffusion timestep t.
     Children are possible next states x_{t-1}.
+    Slots instead of a per-instance __dict__: a tree holds one node per NFE (1e7 at the largest GMM budget).
     """
+    __slots__ = ('x_t', 't', 'timestep_value', 'parent', 'children', 'visit_count', 'value_est', 'noise_pred',
+                 'is_final')
 
     def __init__(self, x_t, t, parent=None, timestep_value=None):
         """
