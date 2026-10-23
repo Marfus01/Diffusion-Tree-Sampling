@@ -218,7 +218,10 @@ def test_tree_statistics_is_read_only_and_matches_traversal(gmm2):
         at_t = [n for n in nodes if n.t == t]
         assert stats['layers'][str(t)]['nodes'] == len(at_t)
         assert stats['layers'][str(t)]['branch_nodes'] == sum(len(n.children) > 1 for n in at_t)
-    # exp(log_w) is the leaf distribution of the value-softmax traversal of sample_from_tree
+    # exp(log_w) is the leaf distribution of the value-softmax traversal of sample_from_tree. The identity
+    # holds up to float32 rounding of r: sample_from_tree overwrites the value of each sampled leaf with a
+    # batched reward evaluation and does not back it up, and on some CPUs the batched float32 reward differs
+    # from the single-sample one in the last bits.
     probs, stack = {}, [(s.meta_root, 0.0)]
     while stack:
         node, lp = stack.pop()
@@ -229,7 +232,7 @@ def test_tree_statistics_is_read_only_and_matches_traversal(gmm2):
         stack.extend((c, lp + zc) for c, zc in zip(node.children, z - np.logaddexp.reduce(z)))
     lw = np.array([w for _, w in leaves])
     np.testing.assert_allclose(np.exp(lw - np.logaddexp.reduce(lw)), np.exp([probs[id(n)] for n, _ in leaves]),
-                               rtol=1e-6, atol=1e-12)
+                               rtol=1e-4, atol=1e-12)
     assert stats['value_error']['meta']['all']['n'] == stats['n_roots']
     n_branch_children = sum(len(n.children) for n in nodes if n.t in (80, 60, 40, 20) and len(n.children) > 1)
     assert sum(v['all']['n'] for k, v in stats['value_error'].items() if k != 'meta') == n_branch_children
