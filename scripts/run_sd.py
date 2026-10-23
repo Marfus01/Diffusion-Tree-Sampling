@@ -59,6 +59,8 @@ def parse_script_args():
     cgroup = parser.add_argument_group('Common Overrides')
     cgroup.add_argument('--prompts', nargs='+', help='List of prompts to use for generation.')
     cgroup.add_argument('--prompts_file', type=str, help='JSON file containing prompts.')
+    cgroup.add_argument('--prompt_ids', nargs='+', type=int,
+                        help='Run only these indices of the prompt list; the per-prompt seed stays seed + index.')
     cgroup.add_argument('--negative_prompt', type=str, help='Negative prompt override.')
     cgroup.add_argument('--sd_model_id', type=str, help='Stable Diffusion model ID override.')
     cgroup.add_argument('--exp_name', type=str, help='Override experiment name prefix.')
@@ -115,6 +117,7 @@ def parse_script_args():
     config.bon_enabled = args.do_bon
     config.maximize = args.maximize
     config.pw_alpha_root = args.pw_alpha_root
+    config.prompt_ids = args.prompt_ids
     config.no_compile = args.no_compile
     if args.no_compile: os.environ["DTS_NO_COMPILE"] = "1"
     if args.base_dir is not None: config.common.base_dir = args.base_dir
@@ -309,7 +312,8 @@ def run_bon(config, prompt, reward_name, pipeline):
     metrics_data = {}
     num_steps = config.sampling.num_inference_steps
     n_list = [max(1, nfe // num_steps) for nfe in config.sampling.compute_budget]
-    gen_batch_size = config.eval.eval_batch_size
+    # FK's UNet batch: every budget is a multiple of it, so the compiled TensorRT engine is reused
+    gen_batch_size = config.fkd.batch_size
     reset_peak_memory()
     images, rewards, gen_time = [], [], 0.0
     for nfe, n_candidates in zip(config.sampling.compute_budget, n_list):
@@ -391,6 +395,7 @@ def run_fkd(config, prompt, reward_name, pipeline):
         metrics = evaluate_images(eval_images, prompt, config)
         metrics.update({'NFEs': nfe_target, 'ActualNFEs': out.nfes, 'ActualParticles': n_particles,
                         'FinalWeightESS': float(1.0 / (w.pow(2).sum() * n_particles)),
+                        'FinalRewardMax': float(out.final_rewards.max()),
                         'Time': elapsed, 'RewardEvals': pipeline.reward_evals, 'PeakMemMB': peak_mem})
         finish_nfe_point(eval_images, metrics, method_name, prompt, reward_name, nfe_target, config)
         metrics_data[nfe_target] = metrics
@@ -644,6 +649,8 @@ def main():
 
     # Distribute prompts
     prompts = config.dataset.prompts
+    if config.prompt_ids:
+        prompts = [prompts[i] for i in config.prompt_ids]
     if not prompts:
         logger.error("Prompt list is empty after loading. Exiting.")
         return
