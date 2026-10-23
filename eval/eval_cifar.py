@@ -8,7 +8,8 @@ real-image features are loaded once), written to <run_dir>/metrics/offline_eval.
             image embeddings (Jayasumana et al. 2024 reference setting), same real set;
   HeldOutAcc fraction classified as the target class by ahsanjavid/convnext-tiny-finetuned-cifar10;
   CLIPDiversity mean sqrt(2 (1 - cos)) over random pairs of generated CLIP embeddings;
-  Distinct  number of distinct images.
+  Distinct  number of distinct images;
+  LogProb_<name> mean log p(c | x) under each --reward_classifier, on the saved uint8 images.
 Duplicates from with-replacement draws stay in the evaluated set.
 """
 import argparse
@@ -104,6 +105,9 @@ def main():
     parser.add_argument('--clip_model', default='openai/clip-vit-large-patch14-336')
     parser.add_argument('--heldout_model', default='ahsanjavid/convnext-tiny-finetuned-cifar10')
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
+    parser.add_argument('--reward_classifier', nargs=3, action='append', default=[], metavar=('NAME', 'KIND', 'PATH'),
+                        help='Adds LogProb_NAME; KIND is resnet (trained by this repository) or '
+                             'resnet18_cifar10_edadaltocg, PATH its checkpoint. Repeatable.')
     args = parser.parse_args()
 
     from pytorch_fid.inception import InceptionV3
@@ -121,15 +125,29 @@ def main():
     held_proc = ConvNextImageProcessor.from_pretrained(args.heldout_model)
     held_model = ConvNextForImageClassification.from_pretrained(args.heldout_model).to(device).eval()
 
+    from src.models.classifier import load_cifar10_classifier
+    reward_models = {name: load_cifar10_classifier(kind, path, device) for name, kind, path in args.reward_classifier}
+
     real_cache = {}
     for run_dir in args.run_dir:
-        rows = evaluate_run(Path(run_dir), real_cache, args.data_path, inception, clip_model, clip_proc, held_model, held_proc, device)
+        rows = evaluate_run(Path(run_dir), real_cache, args.data_path, inception, clip_model, clip_proc, held_model, held_proc, device,
+                            reward_models)
         out = Path(run_dir) / 'metrics' / 'offline_eval.csv'
         pd.DataFrame(rows).to_csv(out, index=False)
         print(f"wrote {out}", flush=True)
 
 
-def evaluate_run(run_dir, real_cache, data_path, inception, clip_model, clip_proc, held_model, held_proc, device):
+@torch.no_grad()
+def mean_log_prob(images_u8, class_idx, model, device, batch=1000):
+    total = 0.0
+    for b in range(0, len(images_u8), batch):
+        x = images_u8[b:b + batch].to(device).float() / 255.0 * 2 - 1
+        total += float(F.log_softmax(model(x), dim=-1)[:, class_idx].double().sum())
+    return total / len(images_u8)
+
+
+def evaluate_run(run_dir, real_cache, data_path, inception, clip_model, clip_proc, held_model, held_proc, device,
+                 reward_models=None):
     from pytorch_fid.fid_score import calculate_frechet_distance
     rows = []
     for f in sorted((run_dir / 'metrics').glob('samples_*.npz')):
@@ -152,6 +170,7 @@ def evaluate_run(run_dir, real_cache, data_path, inception, clip_model, clip_pro
             'HeldOutAcc': heldout_accuracy(fake, class_idx, held_model, held_proc, device),
             'CLIPDiversity': clip_diversity(clip_f),
             'Distinct': int(np.unique(fake.reshape(len(fake), -1).numpy(), axis=0).shape[0]),
+            **{f'LogProb_{name}': mean_log_prob(fake, class_idx, model, device) for name, model in (reward_models or {}).items()},
         })
         print(rows[-1], flush=True)
     return rows

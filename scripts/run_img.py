@@ -108,6 +108,13 @@ def parse_script_args():
     sgroup.add_argument('--sibling_recompute', action='store_true',
                         help='DTS: recompute the UNet (and charge 1 NFE) for every new child of an evaluated node, as in the original code.')
     sgroup.add_argument('--no_save_samples', action='store_true', help='Do not save evaluation samples.')
+    sgroup.add_argument('--smc_impl', choices=['fixed', 'upstream'], default='fixed',
+                        help='SMC/FK, TDS and DAS implementation. fixed: importance weights kept across skipped '
+                             'resampling, systematic resampling, terminal potential r(x_0) with tempering 1, evaluation '
+                             'images drawn by the final weights. upstream: the loop of the upstream repository '
+                             '(FKDDDIMPipeline.sample_batched_smc_upstream) and its evaluation draw, i.e. a random '
+                             'subset of the final particles without replacement, or uniformly with replacement when there '
+                             'are fewer particles than --population_size. NFEs are counted the same way in both.')
 
     args = parser.parse_args()
     config = get_default_image_config()
@@ -385,13 +392,18 @@ def run_smc(config, args, run_class_name, target_class_list, classifier,
     logger.info(f"NFEs per particle for {method_name}: {nfe_per_particle}")
     n_eval = config.sampling.population_size
 
+    upstream = use_smc and args.smc_impl == 'upstream'
+    if upstream:
+        fkd_config_dict['reward_fn'] = reward
+    sampler = pipeline.sample_batched_smc_upstream if upstream else pipeline.sample_batched_smc
+
     for nfe_target in config.sampling.compute_budget:
         n_particles = max(1, nfe_target // nfe_per_particle)
         reward.reset()
         reset_peak_memory()
         t0 = time.time()
         try:
-            out = pipeline.sample_batched_smc(
+            out = sampler(
                 num_particles=n_particles,
                 processing_batch_size=config.fkd.batch_size,
                 num_inference_steps=num_steps,
@@ -420,7 +432,15 @@ def run_smc(config, args, run_class_name, target_class_list, classifier,
         run_reward_evals = reward.n_evals
         peak_mem = peak_memory_mb()
         particles = out.images
-        if use_smc:
+        if upstream:
+            # upstream run_smc: the final particles carry no weight
+            if n_particles > n_eval:
+                idx = torch.randperm(n_particles)[:n_eval]
+            elif n_particles < n_eval:
+                idx = torch.randint(0, n_particles, (n_eval,))
+            else:
+                idx = torch.arange(n_particles)
+        elif use_smc:
             idx = torch.multinomial(torch.softmax(out.log_weights.double(), dim=0), n_eval, replacement=True)
         else:
             idx = torch.randint(0, n_particles, (n_eval,), device=particles.device)
@@ -429,8 +449,8 @@ def run_smc(config, args, run_class_name, target_class_list, classifier,
 
         metrics = evaluate_images(eval_samples, real_loader, target_class_list, classifier, inception_model, config)
         metrics.update({'NFEs': nfe_target, 'ActualNFEs': out.nfes, 'ActualParticles': n_particles,
-                        'FinalWeightESS': float(1.0 / (w.pow(2).sum() * n_particles)),
-                        'InvalidParticles': int((~torch.isfinite(out.log_weights)).sum()) if use_smc
+                        'FinalWeightESS': float('nan') if upstream else float(1.0 / (w.pow(2).sum() * n_particles)),
+                        'InvalidParticles': int((~torch.isfinite(out.log_weights)).sum()) if use_smc and not upstream
                                             else int((~torch.isfinite(particles).flatten(1).all(dim=1)).sum()),
                         'Time': run_time, 'RewardEvals': run_reward_evals, 'PeakMemMB': peak_mem})
         finish_nfe_point(eval_samples, metrics, method_name, run_class_name, nfe_target, output_dir_method, config, args)

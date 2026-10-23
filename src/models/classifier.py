@@ -214,6 +214,24 @@ def train_classifier(model, config, patience=20, epochs=100, device='cpu'):
     return best_params, best_epoch
 
 
+def load_cifar10_classifier(kind, path, device='cpu'):
+    """A trained CIFAR-10 classifier without a run config, taking images in [-1, 1]. kind is
+    'resnet' (the ResNet-18 trained by get_train_classifier, state_dict at path) or
+    CIFARResNet18.name (pytorch_model.bin of edadaltocg/resnet18_cifar10)."""
+    if kind == CIFARResNet18.name:
+        model = CIFARResNet18(num_classes=10)
+        model.net.load_state_dict(torch.load(path, map_location='cpu'))
+    elif kind == 'resnet':
+        model = ResNet(input_size=32, channels=3, num_classes=10, depth=18, finetune=False)
+        model.load_state_dict(torch.load(path, map_location='cpu'))
+    else:
+        raise ValueError(f"Unknown CIFAR-10 classifier kind {kind}")
+    model = model.to(device).eval()
+    for p in model.parameters():
+        p.requires_grad = False
+    return model
+
+
 def get_train_classifier(config):
     """Retrieve a classifier if checkpoint exists, else train one."""
     logger.info("--- Getting Classifier --- ")
