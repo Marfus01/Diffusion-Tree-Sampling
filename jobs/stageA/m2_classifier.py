@@ -1,9 +1,9 @@
-"""Trains (or loads) the CIFAR-10 guiding classifier p_phi of run_img.py and writes its test-set
-accuracy and mean log p_phi(c | x) per class, on the unaugmented test images.
+"""Loads (or, for the repository's own ResNet, trains) the CIFAR-10 guiding classifier p_phi of
+run_img.py and writes its test-set accuracy and mean log p_phi(c | x) per class, on the
+unaugmented test images.
 
-The checkpoint is the one run_img.py resolves for the same --base_dir
-({base_dir}/img/checkpoints/cifar10/cifar10_resnet_best.pt). The upstream trainer keeps the
-epoch with the best test accuracy.
+Without --classifier_path the checkpoint is the one run_img.py resolves for the same --base_dir
+({base_dir}/img/checkpoints/cifar10/cifar10_resnet_best.pt).
 """
 import argparse
 import json
@@ -41,6 +41,8 @@ def main():
     parser.add_argument('--base_dir', required=True)
     parser.add_argument('--out', required=True)
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--classifier_model', default=None)
+    parser.add_argument('--classifier_path', default=None)
     args = parser.parse_args()
 
     config = get_default_image_config()
@@ -48,6 +50,8 @@ def main():
     config.common.base_dir = args.base_dir
     config.common.exp_name = 'classifier'
     config.common.seed = args.seed
+    config.model.classifier_model = args.classifier_model
+    config.model.classifier_path = args.classifier_path
     config = process_image_config(config)
 
     device = config.common.device
@@ -58,11 +62,13 @@ def main():
     correct, count, log_p = per_class_stats(classifier, loader, device, config.dataset.num_classes)
     acc = correct / count
     out = {
+        'classifier_model': config.model.classifier_model,
         'checkpoint': ckpt,
         'overall_accuracy': float(correct.sum() / count.sum()),
         'per_class_accuracy': {str(c): float(a) for c, a in enumerate(acc)},
         'per_class_mean_log_p': {str(c): float(v) for c, v in enumerate(log_p / count)},
         'classes_by_accuracy': [int(c) for c in np.argsort(-acc)],
+        'classes_by_mean_log_p': [int(c) for c in np.argsort(-(log_p / count))],
     }
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out).write_text(json.dumps(out, indent=2))

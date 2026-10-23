@@ -106,6 +106,26 @@ class ResNet(nn.Module):
         return self.out_layer(x)
 
 
+class CIFARResNet18(nn.Module):
+    """Pretrained CIFAR-10 ResNet-18 of edadaltocg/resnet18_cifar10 (torchvision resnet18 with a
+    3x3 stride-1 stem and no max-pool). Takes images in [-1, 1]; the network expects [0, 1]
+    inputs normalized by the CIFAR-10 mean and std below, so both the reward and its gradient go
+    through that conversion."""
+
+    name = "resnet18_cifar10_edadaltocg"
+
+    def __init__(self, num_classes=10):
+        super().__init__()
+        self.net = models.resnet18(num_classes=num_classes)
+        self.net.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+        self.net.maxpool = nn.Identity()
+        self.register_buffer('mean', torch.tensor([0.4914, 0.4822, 0.4465]).view(1, 3, 1, 1))
+        self.register_buffer('std', torch.tensor([0.2023, 0.1994, 0.2010]).view(1, 3, 1, 1))
+
+    def forward(self, x):
+        return self.net(((x + 1) / 2 - self.mean) / self.std)
+
+
 def train_classifier(model, config, patience=20, epochs=100, device='cpu'):
     """Train a classifier model."""
 
@@ -197,6 +217,17 @@ def train_classifier(model, config, patience=20, epochs=100, device='cpu'):
 def get_train_classifier(config):
     """Retrieve a classifier if checkpoint exists, else train one."""
     logger.info("--- Getting Classifier --- ")
+
+    if config.model.classifier_model == CIFARResNet18.name:
+        if not config.paths.classifier_load_path or not Path(config.paths.classifier_load_path).exists():
+            raise FileNotFoundError(f"{CIFARResNet18.name} needs --classifier_path to its pytorch_model.bin")
+        classifier = CIFARResNet18(num_classes=config.dataset.num_classes)
+        classifier.net.load_state_dict(torch.load(config.paths.classifier_load_path, map_location='cpu'))
+        logger.info(f"Loaded pretrained {CIFARResNet18.name} from {config.paths.classifier_load_path}")
+        classifier = classifier.to(config.common.device).eval()
+        for p in classifier.parameters():
+            p.requires_grad = False
+        return classifier
 
     # Instantiate the model based on config
     if 'cnn' in config.model.classifier_model.lower():

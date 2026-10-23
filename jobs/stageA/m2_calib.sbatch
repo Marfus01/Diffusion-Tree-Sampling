@@ -14,6 +14,7 @@ export DTS_CODE=$HOME/run/dts/wt-m2
 source $DTS_CODE/jobs/stageA/env.sh
 B=$DTS_BASE_DIR/cifar10
 RES=$B/img/results_tree_viz/cifar10
+CLF="--classifier_model resnet18_cifar10_edadaltocg --classifier_path $DTS_ROOT/scratch/classifiers/edadaltocg_resnet18_cifar10/pytorch_model.bin"
 N_TASKS=${SLURM_ARRAY_TASK_COUNT:-1}
 TASK=${SLURM_ARRAY_TASK_ID:-0}
 
@@ -26,7 +27,7 @@ while IFS='|' read -r label flags line_seeds; do
       name=m2c_${label}_s${s}
       echo "[$(date)] $name: $flags"
       python -m scripts.run_img --dataset cifar10 --sample_classes $CLASS --compute_budget $NFE \
-        --population_size 5000 --seed $s --no_progress_bar --base_dir $B --exp_name $name $flags < /dev/null \
+        --population_size 5000 --seed $s --no_progress_bar --base_dir $B --exp_name $name $CLF $flags < /dev/null \
         || echo "[$(date)] $name FAILED"
       if ls $RES/${CLASS}_$name/metrics/samples_*.npz >/dev/null 2>&1; then
         python -m eval.eval_cifar --run_dir $RES/${CLASS}_$name --data_path $DTS_DATA_DIR < /dev/null || echo "[$(date)] $name eval FAILED"

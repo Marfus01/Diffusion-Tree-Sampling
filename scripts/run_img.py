@@ -76,6 +76,7 @@ def parse_script_args():
     cgroup.add_argument('--hf_home', type=str, help='Override HuggingFace cache directory (HF_HOME).')
     cgroup.add_argument('--base_dir', type=str, help='Experiment root (default $DTS_BASE_DIR or ~/mcts/experiments).')
     cgroup.add_argument('--classifier_path', type=str, help='Guiding classifier checkpoint (trained and saved here if missing).')
+    cgroup.add_argument('--classifier_model', type=str, help='Guiding classifier: resnet (trained by this repository, default) or resnet18_cifar10_edadaltocg (pretrained, needs --classifier_path).')
 
     # --- Method Enabling ---
     mgroup = parser.add_argument_group('Method Selection')
@@ -120,6 +121,7 @@ def parse_script_args():
     if args.hf_home is not None: config.common.hf_home = args.hf_home
     if args.base_dir is not None: config.common.base_dir = args.base_dir
     if args.classifier_path is not None: config.model.classifier_path = args.classifier_path
+    if args.classifier_model is not None: config.model.classifier_model = args.classifier_model
     if args.adaptive_resampling is not None: config.fkd.adaptive_resampling = args.adaptive_resampling
     if args.resampling_steps is not None:
         config.fkd.resampling_t_start, config.fkd.resampling_t_end, config.fkd.resample_frequency = args.resampling_steps
