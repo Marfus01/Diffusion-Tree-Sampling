@@ -6,7 +6,8 @@ differs from the analytic pi*_0 by the discretization of the reverse kernel. Dra
 weighted by e^{lambda r} give, for each instance,
 
 - E[r], the component masses under the pi*_0 MAP partition (`map_component`) and their mode-mass
-  TV to the analytic weights w~_k, each with its delta-method standard error;
+  TV to the analytic weights w~_k, with delta-method standard errors and the TV expected from
+  SNIS noise alone;
 - the same quantities minus the analytic values (E_{pi*_0}[r] closed form, w~_k);
 - SW between a systematic resample of the first `--n_keep` draws and exact pi*_0 draws, next to
   SW between two exact pi*_0 draws of the same size;
@@ -102,7 +103,8 @@ def run_instance(path, args):
         'mean_reward_minus_analytic': er - problem.target_mean_reward(),
         'mass': mass.tolist(), 'mass_se': mass_se.tolist(), 'analytic_weights': w_tilde.tolist(),
         'mode_tv_to_analytic': 0.5 * float((mass - w_tilde).abs().sum()),
-        'max_abs_mass_diff_over_se': float(((mass - w_tilde).abs() / mass_se.clamp(min=1e-12)).max()),
+        # expected mode-mass TV from SNIS noise alone: 0.5 sum_k E|N(0, se_k^2)|
+        'mode_tv_noise_floor': 0.5 * math.sqrt(2 / math.pi) * float(mass_se.sum()),
         'n_ref': args.n_ref,
         'sw_ref_to_exact': sliced_wasserstein(ref, exact_a, n_projections=args.sw_projections),
         'sw_exact_to_exact': sliced_wasserstein(exact_b, exact_a, n_projections=args.sw_projections),
