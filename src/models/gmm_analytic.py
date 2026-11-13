@@ -5,7 +5,9 @@ Prior: 25 unit-covariance components with means (-8i, -8j, ..., -8i, -8j) in R^{
 y = A x* + sigma_y eps with A in R^{d_y x d_x}, as in `generate_measurement_equations` of
 gabrielvc/benchopts_inverse_problem_diffusion_prior: A = U diag(s) V_{:d_y} with the
 singular values s ~ U(0, 1) sorted, sigma_y ~ U(0, max s), x* drawn from the prior.
-Each problem instance (seed) redraws the prior weights, A, sigma_y and y.
+Each problem instance (seed) redraws the prior weights, A, sigma_y and y. The draw from a
+seed depends on the torch version, so runs record the drawn parameters (`instance_params`)
+and `GMMInverseProblem(**params)` rebuilds the instance.
 
 Reward r(x_0) = log N(y; A x_0, sigma_y^2 I). The target is
 pi*_0(x_0) ∝ p_0(x_0) e^{lambda r(x_0)}, a Gaussian mixture with component covariance
@@ -27,6 +29,8 @@ from src.models.diffusion_2d import DiffusionModel
 
 
 def mixture_means(dim: int) -> torch.Tensor:
+    if dim % 2 != 0:
+        raise ValueError("dim must be even (means repeat a 2D pattern)")
     means = []
     for i in range(-2, 3):
         for j in range(-2, 3):
@@ -35,33 +39,44 @@ def mixture_means(dim: int) -> torch.Tensor:
 
 
 class GMMInverseProblem:
-    def __init__(self, dim: int, instance_seed: int, dim_y: int = 1, lmbda: float = 1.0, device='cpu'):
-        if dim % 2 != 0:
-            raise ValueError("dim must be even (means repeat a 2D pattern)")
-        self.dim = dim
-        self.dim_y = dim_y
+    def __init__(self, weights, A, sigma_y: float, y, lmbda: float = 1.0, device='cpu'):
+        """weights [K] prior component weights, A [d_y, d_x], y [d_y]; float64 is kept throughout."""
+        self.A = torch.as_tensor(A, dtype=torch.float64)                # [d_y, d]
+        self.dim_y, self.dim = self.A.shape
         self.lmbda = lmbda
         self.device = torch.device(device)
-        g = torch.Generator().manual_seed(instance_seed)
-
-        self.means = mixture_means(dim).double()                     # [K, d]
-        weights = torch.randn(len(self.means), generator=g, dtype=torch.float64) ** 2
-        self.weights = weights / weights.sum()                       # [K]
-
-        A = torch.randn(dim_y, dim, generator=g, dtype=torch.float64)
-        U, s, Vh = torch.linalg.svd(A, full_matrices=True)
-        s = torch.sort(torch.rand(s.shape, generator=g, dtype=torch.float64), descending=True).values
-        self.A = U @ torch.diag(s) @ Vh[:dim_y, :]                   # [d_y, d]
-        self.sigma_y = float(torch.rand(1, generator=g, dtype=torch.float64)[0] * s.max())
-        comp = torch.multinomial(self.weights, 1, generator=g).item()
-        x_star = self.means[comp] + torch.randn(dim, generator=g, dtype=torch.float64)
-        self.y = self.A @ x_star + self.sigma_y * torch.randn(dim_y, generator=g, dtype=torch.float64)
+        self.means = mixture_means(self.dim).double()                  # [K, d]
+        self.weights = torch.as_tensor(weights, dtype=torch.float64)   # [K]
+        self.sigma_y = float(sigma_y)
+        self.y = torch.as_tensor(y, dtype=torch.float64)               # [d_y]
 
         self._posterior = self._compute_posterior(lmbda)
         self._means_f = self.means.float().to(self.device)
         self._log_w_f = torch.log(self.weights).float().to(self.device)
         self._A_f = self.A.float().to(self.device)
         self._y_f = self.y.float().to(self.device)
+
+    @classmethod
+    def from_seed(cls, dim: int, instance_seed: int, dim_y: int = 1, lmbda: float = 1.0, device='cpu'):
+        g = torch.Generator().manual_seed(instance_seed)
+        means = mixture_means(dim).double()
+        weights = torch.randn(len(means), generator=g, dtype=torch.float64) ** 2
+        weights = weights / weights.sum()
+
+        A = torch.randn(dim_y, dim, generator=g, dtype=torch.float64)
+        U, s, Vh = torch.linalg.svd(A, full_matrices=True)
+        s = torch.sort(torch.rand(s.shape, generator=g, dtype=torch.float64), descending=True).values
+        A = U @ torch.diag(s) @ Vh[:dim_y, :]
+        sigma_y = float(torch.rand(1, generator=g, dtype=torch.float64)[0] * s.max())
+        comp = torch.multinomial(weights, 1, generator=g).item()
+        x_star = means[comp] + torch.randn(dim, generator=g, dtype=torch.float64)
+        y = A @ x_star + sigma_y * torch.randn(dim_y, generator=g, dtype=torch.float64)
+        return cls(weights, A, sigma_y, y, lmbda=lmbda, device=device)
+
+    def instance_params(self) -> dict:
+        """JSON-serializable constructor arguments; floats round-trip exactly through json."""
+        return {'weights': self.weights.tolist(), 'A': self.A.tolist(), 'sigma_y': self.sigma_y,
+                'y': self.y.tolist()}
 
     # ---- target ----
     def _compute_posterior(self, lmbda):

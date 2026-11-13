@@ -10,7 +10,7 @@ from src.models.gmm_analytic import GMMInverseProblem, AnalyticGMMDiffusion, sli
 
 @pytest.fixture(scope="module", params=[8, 80])
 def problem(request):
-    return GMMInverseProblem(dim=request.param, instance_seed=0)
+    return GMMInverseProblem.from_seed(dim=request.param, instance_seed=0)
 
 
 def q_t_log_prob(problem, x, abar):
@@ -64,7 +64,7 @@ def test_target_mean_reward_matches_samples(problem):
 def test_log_soft_value_matches_monte_carlo(problem, lmbda, abar):
     """log M_t against Monte Carlo over exact q_0|t draws, at x_t forward-noised from pi*_0 samples
     (where the Monte Carlo estimate has enough effective samples)."""
-    p = GMMInverseProblem(dim=problem.dim, instance_seed=0, lmbda=lmbda)
+    p = GMMInverseProblem.from_seed(dim=problem.dim, instance_seed=0, lmbda=lmbda)
     g = torch.Generator().manual_seed(9)
     x0_target = torch.from_numpy(p.sample_target(4, seed=11)).double()
     x = math.sqrt(abar) * x0_target + math.sqrt(1 - abar) * torch.randn(4, p.dim, generator=g, dtype=torch.float64)
@@ -106,7 +106,7 @@ def test_sliced_wasserstein_basic():
 
 def test_prior_chain_close_to_q0():
     """Unguided reverse chain with eps* starts at q_{T-1} and ends near q_0 (discretization only)."""
-    problem = GMMInverseProblem(dim=8, instance_seed=0)
+    problem = GMMInverseProblem.from_seed(dim=8, instance_seed=0)
     model = AnalyticGMMDiffusion(problem, device='cpu')
     torch.manual_seed(5)
     x = model.sample_initial_noise(2000)

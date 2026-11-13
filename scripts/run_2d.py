@@ -71,6 +71,9 @@ def parse_script_args():
     ggroup.add_argument('--gmm_dim', type=int, help='d_x of the GMM prior.')
     ggroup.add_argument('--gmm_instance', type=int, default=0,
                         help='Problem-instance seed: redraws prior weights, A, sigma_y and y.')
+    ggroup.add_argument('--gmm_params', type=str,
+                        help='JSON of GMMInverseProblem.instance_params(); builds the instance from it instead of '
+                             'drawing from --gmm_instance, which then only labels the run. Sets --gmm_dim.')
     ggroup.add_argument('--sw_projections', type=int, default=10_000, help='Random directions for sliced Wasserstein.')
 
     mgroup = parser.add_argument_group('Method Selection')
@@ -111,6 +114,9 @@ def parse_script_args():
                              'distribution) to tree_stats_<method>_seed<seed>.json. Read-only, samples are unchanged.')
 
     args = parser.parse_args()
+    if args.gmm_params is not None:
+        with open(args.gmm_params) as f:
+            args.gmm_dim = len(json.load(f)['A'][0])
     if args.dataset == 'gmm' and args.gmm_dim is None:
         parser.error("--dataset gmm requires --gmm_dim")
     return args
@@ -172,8 +178,12 @@ def load_task(config, args):
     calculate_reward_diff, plus the GMM problem (or None)."""
     device = config.common.device
     if args.dataset == 'gmm':
-        problem = GMMInverseProblem(dim=args.gmm_dim, instance_seed=args.gmm_instance,
-                                    lmbda=args.reward_lambda, device=device)
+        if args.gmm_params is not None:
+            with open(args.gmm_params) as f:
+                problem = GMMInverseProblem(**json.load(f), lmbda=args.reward_lambda, device=device)
+        else:
+            problem = GMMInverseProblem.from_seed(dim=args.gmm_dim, instance_seed=args.gmm_instance,
+                                                  lmbda=args.reward_lambda, device=device)
         model = AnalyticGMMDiffusion(problem, n_timesteps=config.model.n_timesteps,
                                      beta_start=config.model.beta_start, beta_end=config.model.beta_end,
                                      device=device)
@@ -494,8 +504,8 @@ def main():
                                                          q0, n_projections=args.sw_projections)
             target_split = problem.sample_target(config.sampling.population_size, seed=30_000 + seed)
             extra['target_split_SW'] = sliced_wasserstein(target_split, task.gt_samples, n_projections=args.sw_projections)
-            extra['gmm'] = {'dim': problem.dim, 'instance': args.gmm_instance, 'sigma_y': problem.sigma_y,
-                            'y': problem.y.tolist(), 'posterior_weights': problem.posterior_weights.tolist()}
+            extra['gmm'] = {'dim': problem.dim, 'instance': args.gmm_instance, 'params': problem.instance_params(),
+                            'posterior_weights': problem.posterior_weights.tolist()}
             logger.info(f"SW(p_theta,0, q_0) = {extra['discretization_SW']:.4f} (two exact q_0 draws: {extra['prior_split_SW']:.4f}); "
                         f"SW between two exact target draws = {extra['target_split_SW']:.4f}")
         write_run_meta(config.paths.run_dir, config, args, extra=extra, name=f"run_meta_seed{seed}.json")

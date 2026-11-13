@@ -75,7 +75,7 @@ def test_max_potential_running_max_and_resampling():
 @pytest.fixture(scope="module")
 def gmm2():
     # instance with a multimodal posterior that is far from the prior
-    problem = GMMInverseProblem(dim=2, instance_seed=8)
+    problem = GMMInverseProblem.from_seed(dim=2, instance_seed=8)
     return problem, AnalyticGMMDiffusion(problem, device='cpu')
 
 
@@ -177,7 +177,7 @@ def test_dts_approaches_target(gmm2):
 def test_diverging_guidance_is_reported_not_masked():
     """d_x=80 instance 0: TDS with guidance_scale 1 diverges for every particle and must raise
     instead of returning NaN samples with finite weights; guidance_scale 0.5 stays finite."""
-    problem = GMMInverseProblem(dim=80, instance_seed=0)
+    problem = GMMInverseProblem.from_seed(dim=80, instance_seed=0)
     model = AnalyticGMMDiffusion(problem, device='cpu')
     with pytest.raises(SMCDivergedError):
         run_smc(model, problem, 256, use_smc=True, use_guidance=True, adaptive=True, guidance_scale=1.0)
