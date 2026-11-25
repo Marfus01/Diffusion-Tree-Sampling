@@ -1,16 +1,19 @@
 """Offline metrics for saved CIFAR-10 evaluation samples (run_img.py samples_*.npz).
 
-For each samples_<method>_<class>_N<nfe>.npz in --run_dir/metrics:
+For each samples_<method>_<class>_N<nfe>.npz in <run_dir>/metrics of every --run_dir (models and
+real-image features are loaded once), written to <run_dir>/metrics/offline_eval.csv:
   FID2048   Inception-v3 pool features (pytorch-fid), real set = the class's test images
             without augmentation;
   CMMD      MMD with a Gaussian kernel (sigma = 10, x1000) on L2-normalized CLIP ViT-L/14-336px
             image embeddings (Jayasumana et al. 2024 reference setting), same real set;
   HeldOutAcc fraction classified as the target class by ahsanjavid/convnext-tiny-finetuned-cifar10;
   CLIPDiversity mean sqrt(2 (1 - cos)) over random pairs of generated CLIP embeddings;
-  Distinct  number of distinct images.
+  Distinct  number of distinct images;
+  LogProb_<name> mean log p(c | x) under each --reward_classifier, on the saved uint8 images.
 Duplicates from with-replacement draws stay in the evaluated set.
 """
 import argparse
+import os
 import re
 from pathlib import Path
 
@@ -39,12 +42,29 @@ def inception_features(images_u8, model, device, batch=250):
     return torch.cat(feats).numpy()
 
 
+class _Processed(torch.utils.data.Dataset):
+    """uint8 [N, 3, H, W] images through a Hugging Face image processor, one image per item, so
+    that DataLoader workers run the (PIL) preprocessing in parallel."""
+    def __init__(self, images_u8, processor):
+        self.images, self.processor = images_u8, processor
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, i):
+        return self.processor(images=self.images[i].permute(1, 2, 0).numpy(), return_tensors="pt")['pixel_values'][0]
+
+
+def processed_batches(images_u8, processor, batch=250):
+    workers = max(len(os.sched_getaffinity(0)) - 1, 0)
+    return torch.utils.data.DataLoader(_Processed(images_u8, processor), batch_size=batch, num_workers=workers)
+
+
 @torch.no_grad()
-def clip_embeddings(images_u8, model, processor, device, batch=250):
+def clip_embeddings(images_u8, model, processor, device):
     out = []
-    for b in range(0, len(images_u8), batch):
-        inputs = processor(images=list(images_u8[b:b + batch].permute(0, 2, 3, 1).numpy()), return_tensors="pt").to(device)
-        e = model.get_image_features(**inputs)
+    for pixels in processed_batches(images_u8, processor):
+        e = model.get_image_features(pixel_values=pixels.to(device))
         out.append(F.normalize(e.float(), dim=-1).cpu())
     return torch.cat(out).double()
 
@@ -70,46 +90,73 @@ def clip_diversity(e, max_pairs=10_000, seed=0):
 
 
 @torch.no_grad()
-def heldout_accuracy(images_u8, class_idx, model, processor, device, batch=250):
+def heldout_accuracy(images_u8, class_idx, model, processor, device):
     correct = 0
-    for b in range(0, len(images_u8), batch):
-        inputs = processor(images=list(images_u8[b:b + batch].permute(0, 2, 3, 1).numpy()), return_tensors="pt").to(device)
-        pred = model(**inputs).logits.argmax(-1)
+    for pixels in processed_batches(images_u8, processor):
+        pred = model(pixel_values=pixels.to(device)).logits.argmax(-1)
         correct += int((pred == class_idx).sum())
     return correct / len(images_u8)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--run_dir', required=True)
+    parser.add_argument('--run_dir', required=True, nargs='+')
     parser.add_argument('--data_path', required=True, help='torchvision CIFAR-10 root')
     parser.add_argument('--clip_model', default='openai/clip-vit-large-patch14-336')
     parser.add_argument('--heldout_model', default='ahsanjavid/convnext-tiny-finetuned-cifar10')
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
-    parser.add_argument('--out', default=None)
+    parser.add_argument('--reward_classifier', nargs=3, action='append', default=[], metavar=('NAME', 'KIND', 'PATH'),
+                        help='Adds LogProb_NAME; KIND is resnet (trained by this repository) or '
+                             'resnet18_cifar10_edadaltocg, PATH its checkpoint. Repeatable.')
     args = parser.parse_args()
 
     from pytorch_fid.inception import InceptionV3
-    from pytorch_fid.fid_score import calculate_frechet_distance
-    from transformers import CLIPModel, CLIPProcessor, AutoImageProcessor, AutoModelForImageClassification
+    # The concrete ConvNeXt classes: the Auto classes import timm_wrapper, which needs timm >= 1.0.
+    from transformers import CLIPModel, CLIPProcessor, ConvNextImageProcessor, ConvNextForImageClassification
 
+    # TF32 matmuls and convolutions: 3.5x faster CLIP ViT-L/14-336 on A800, embeddings within
+    # cosine 0.99997 of fp32.
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
     device = args.device
     inception = InceptionV3([InceptionV3.BLOCK_INDEX_BY_DIM[2048]]).to(device).eval()
     clip_model = CLIPModel.from_pretrained(args.clip_model).to(device).eval()
     clip_proc = CLIPProcessor.from_pretrained(args.clip_model)
-    held_proc = AutoImageProcessor.from_pretrained(args.heldout_model)
-    held_model = AutoModelForImageClassification.from_pretrained(args.heldout_model).to(device).eval()
+    held_proc = ConvNextImageProcessor.from_pretrained(args.heldout_model)
+    held_model = ConvNextForImageClassification.from_pretrained(args.heldout_model).to(device).eval()
 
-    files = sorted((Path(args.run_dir) / 'metrics').glob('samples_*.npz'))
+    from src.models.classifier import load_cifar10_classifier
+    reward_models = {name: load_cifar10_classifier(kind, path, device) for name, kind, path in args.reward_classifier}
+
     real_cache = {}
+    for run_dir in args.run_dir:
+        rows = evaluate_run(Path(run_dir), real_cache, args.data_path, inception, clip_model, clip_proc, held_model, held_proc, device,
+                            reward_models)
+        out = Path(run_dir) / 'metrics' / 'offline_eval.csv'
+        pd.DataFrame(rows).to_csv(out, index=False)
+        print(f"wrote {out}", flush=True)
+
+
+@torch.no_grad()
+def mean_log_prob(images_u8, class_idx, model, device, batch=1000):
+    total = 0.0
+    for b in range(0, len(images_u8), batch):
+        x = images_u8[b:b + batch].to(device).float() / 255.0 * 2 - 1
+        total += float(F.log_softmax(model(x), dim=-1)[:, class_idx].double().sum())
+    return total / len(images_u8)
+
+
+def evaluate_run(run_dir, real_cache, data_path, inception, clip_model, clip_proc, held_model, held_proc, device,
+                 reward_models=None):
+    from pytorch_fid.fid_score import calculate_frechet_distance
     rows = []
-    for f in files:
+    for f in sorted((run_dir / 'metrics').glob('samples_*.npz')):
         m = PATTERN.match(f.name)
         if m is None:
             continue
         class_idx = int(m['run_class'].split('_')[1])
         if class_idx not in real_cache:
-            real = load_real(args.data_path, class_idx)
+            real = load_real(data_path, class_idx)
             fr = inception_features(real, inception, device)
             real_cache[class_idx] = (np.mean(fr, 0), np.cov(fr, rowvar=False), clip_embeddings(real, clip_model, clip_proc, device))
         mu_r, sig_r, clip_r = real_cache[class_idx]
@@ -123,11 +170,10 @@ def main():
             'HeldOutAcc': heldout_accuracy(fake, class_idx, held_model, held_proc, device),
             'CLIPDiversity': clip_diversity(clip_f),
             'Distinct': int(np.unique(fake.reshape(len(fake), -1).numpy(), axis=0).shape[0]),
+            **{f'LogProb_{name}': mean_log_prob(fake, class_idx, model, device) for name, model in (reward_models or {}).items()},
         })
         print(rows[-1], flush=True)
-    out = args.out or str(Path(args.run_dir) / 'metrics' / 'offline_eval.csv')
-    pd.DataFrame(rows).to_csv(out, index=False)
-    print(f"wrote {out}")
+    return rows
 
 
 if __name__ == '__main__':

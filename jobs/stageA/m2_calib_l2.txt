@@ -1,0 +1,20 @@
+# A-R006 layer 2 (label|run_img flags[|seeds]). Layer 1: FK branch times (adaptive on and off
+# identical), DPS-RG best at the grid edge 4, TDS best at the grid edge 0.5.
+DPS-RG__s8|--do_guidance --guidance_scale 8
+DPS-RG__s16|--do_guidance --guidance_scale 16
+TDS__s0.25|--do_smc_guidance --guidance_scale 0.25
+TDS__s0.5-branch-adaT|--do_smc_guidance --guidance_scale 0.5 --adaptive_resampling true
+TDS__s0.5-every-adaF|--do_smc_guidance --guidance_scale 0.5 --resampling_steps 0 49 1 --adaptive_resampling false
+TDS__s0.5-every-adaT|--do_smc_guidance --guidance_scale 0.5 --resampling_steps 0 49 1 --adaptive_resampling true
+DAS__g0.0142-branch-adaF|--do_smc_guidance_tempering --guidance_scale 0.5 --das_gamma 0.0142 --adaptive_resampling false
+DAS__g0.0163-branch-adaF|--do_smc_guidance_tempering --guidance_scale 0.5 --das_gamma 0.0163 --adaptive_resampling false
+DAS__g0.03-branch-adaF|--do_smc_guidance_tempering --guidance_scale 0.5 --das_gamma 0.03 --adaptive_resampling false
+DAS__g0.0142-branch-adaT|--do_smc_guidance_tempering --guidance_scale 0.5 --das_gamma 0.0142 --adaptive_resampling true
+DAS__g0.0163-branch-adaT|--do_smc_guidance_tempering --guidance_scale 0.5 --das_gamma 0.0163 --adaptive_resampling true
+DAS__g0.03-branch-adaT|--do_smc_guidance_tempering --guidance_scale 0.5 --das_gamma 0.03 --adaptive_resampling true
+DAS__g0.0142-every-adaF|--do_smc_guidance_tempering --guidance_scale 0.5 --das_gamma 0.0142 --resampling_steps 0 49 1 --adaptive_resampling false
+DAS__g0.0163-every-adaF|--do_smc_guidance_tempering --guidance_scale 0.5 --das_gamma 0.0163 --resampling_steps 0 49 1 --adaptive_resampling false
+DAS__g0.03-every-adaF|--do_smc_guidance_tempering --guidance_scale 0.5 --das_gamma 0.03 --resampling_steps 0 49 1 --adaptive_resampling false
+DAS__g0.0142-every-adaT|--do_smc_guidance_tempering --guidance_scale 0.5 --das_gamma 0.0142 --resampling_steps 0 49 1 --adaptive_resampling true
+DAS__g0.0163-every-adaT|--do_smc_guidance_tempering --guidance_scale 0.5 --das_gamma 0.0163 --resampling_steps 0 49 1 --adaptive_resampling true
+DAS__g0.03-every-adaT|--do_smc_guidance_tempering --guidance_scale 0.5 --das_gamma 0.03 --resampling_steps 0 49 1 --adaptive_resampling true

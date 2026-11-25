@@ -76,6 +76,7 @@ def parse_script_args():
     cgroup.add_argument('--hf_home', type=str, help='Override HuggingFace cache directory (HF_HOME).')
     cgroup.add_argument('--base_dir', type=str, help='Experiment root (default $DTS_BASE_DIR or ~/mcts/experiments).')
     cgroup.add_argument('--classifier_path', type=str, help='Guiding classifier checkpoint (trained and saved here if missing).')
+    cgroup.add_argument('--classifier_model', type=str, help='Guiding classifier: resnet (trained by this repository, default) or resnet18_cifar10_edadaltocg (pretrained, needs --classifier_path).')
 
     # --- Method Enabling ---
     mgroup = parser.add_argument_group('Method Selection')
@@ -107,6 +108,13 @@ def parse_script_args():
     sgroup.add_argument('--sibling_recompute', action='store_true',
                         help='DTS: recompute the UNet (and charge 1 NFE) for every new child of an evaluated node, as in the original code.')
     sgroup.add_argument('--no_save_samples', action='store_true', help='Do not save evaluation samples.')
+    sgroup.add_argument('--smc_impl', choices=['fixed', 'upstream'], default='fixed',
+                        help='SMC/FK, TDS and DAS implementation. fixed: importance weights kept across skipped '
+                             'resampling, systematic resampling, terminal potential r(x_0) with tempering 1, evaluation '
+                             'images drawn by the final weights. upstream: the loop of the upstream repository '
+                             '(FKDDDIMPipeline.sample_batched_smc_upstream) and its evaluation draw, i.e. a random '
+                             'subset of the final particles without replacement, or uniformly with replacement when there '
+                             'are fewer particles than --population_size. NFEs are counted the same way in both.')
 
     args = parser.parse_args()
     config = get_default_image_config()
@@ -120,6 +128,7 @@ def parse_script_args():
     if args.hf_home is not None: config.common.hf_home = args.hf_home
     if args.base_dir is not None: config.common.base_dir = args.base_dir
     if args.classifier_path is not None: config.model.classifier_path = args.classifier_path
+    if args.classifier_model is not None: config.model.classifier_model = args.classifier_model
     if args.adaptive_resampling is not None: config.fkd.adaptive_resampling = args.adaptive_resampling
     if args.resampling_steps is not None:
         config.fkd.resampling_t_start, config.fkd.resampling_t_end, config.fkd.resample_frequency = args.resampling_steps
@@ -265,10 +274,14 @@ def save_eval_samples(images, path):
     np.savez_compressed(path, images=arr)
 
 
+def samples_path(config, method_name, run_class_name, target_nfes):
+    return Path(config.paths.metrics_dir) / f"samples_{method_name}_{run_class_name}_N{target_nfes}.npz"
+
+
 def finish_nfe_point(images, metrics, method_name, run_class_name, target_nfes, output_dir, config, args):
     metrics['Distinct'] = distinct_count(images)
     if not args.no_save_samples:
-        save_eval_samples(images, Path(config.paths.metrics_dir) / f"samples_{method_name}_{run_class_name}_N{target_nfes}.npz")
+        save_eval_samples(images, samples_path(config, method_name, run_class_name, target_nfes))
     grid = images[torch.randperm(images.shape[0])[:config.sampling.gen_batch_size]] if images.shape[0] > config.sampling.gen_batch_size else images
     grid = (grid / 2 + 0.5).clamp(0, 1)
     save_image(grid.cpu(), output_dir / f"{run_class_name}_{target_nfes}.png", nrow=int(math.ceil(np.sqrt(grid.shape[0]))))
@@ -346,7 +359,8 @@ def run_smc(config, args, run_class_name, target_class_list, classifier,
             inception_model, real_loader, pipeline, method_name="SMC"):
     """Runs SMC/FK, DPS-RG ('Guidance'), TDS ('SMC-Guidance'), DAS ('SMC-Guidance-Tempering') or
     SMC-Rollout. Every NFE point is a separate run with K = NFE // (NFE per particle) particles;
-    SMC methods draw the population_size evaluation images with replacement by their final weights."""
+    SMC methods draw the population_size evaluation images with replacement by their final weights,
+    DPS-RG uniformly with replacement."""
     logger.info(f"--- Running {method_name} for {run_class_name} ---")
     metrics_data = {}
 
@@ -378,13 +392,18 @@ def run_smc(config, args, run_class_name, target_class_list, classifier,
     logger.info(f"NFEs per particle for {method_name}: {nfe_per_particle}")
     n_eval = config.sampling.population_size
 
+    upstream = use_smc and args.smc_impl == 'upstream'
+    if upstream:
+        fkd_config_dict['reward_fn'] = reward
+    sampler = pipeline.sample_batched_smc_upstream if upstream else pipeline.sample_batched_smc
+
     for nfe_target in config.sampling.compute_budget:
         n_particles = max(1, nfe_target // nfe_per_particle)
         reward.reset()
         reset_peak_memory()
         t0 = time.time()
         try:
-            out = pipeline.sample_batched_smc(
+            out = sampler(
                 num_particles=n_particles,
                 processing_batch_size=config.fkd.batch_size,
                 num_inference_steps=num_steps,
@@ -406,16 +425,23 @@ def run_smc(config, args, run_class_name, target_class_list, classifier,
             logger.error(f"  {method_name} NFE {nfe_target} ({n_particles} particles): {e}")
             metrics_data[nfe_target] = {'NFEs': nfe_target, 'ActualParticles': n_particles, 'Diverged': 1,
                                         'Time': time.time() - t0}
+            samples_path(config, method_name, run_class_name, nfe_target).unlink(missing_ok=True)   # stale file of an earlier run
             continue
         if torch.cuda.is_available(): torch.cuda.synchronize()
         run_time = time.time() - t0
         run_reward_evals = reward.n_evals
         peak_mem = peak_memory_mb()
         particles = out.images
-        if use_smc:
+        if upstream:
+            # upstream run_smc: the final particles carry no weight
+            if n_particles > n_eval:
+                idx = torch.randperm(n_particles)[:n_eval]
+            elif n_particles < n_eval:
+                idx = torch.randint(0, n_particles, (n_eval,))
+            else:
+                idx = torch.arange(n_particles)
+        elif use_smc:
             idx = torch.multinomial(torch.softmax(out.log_weights.double(), dim=0), n_eval, replacement=True)
-        elif n_particles >= n_eval:
-            idx = torch.randperm(n_particles, device=particles.device)[:n_eval]
         else:
             idx = torch.randint(0, n_particles, (n_eval,), device=particles.device)
         eval_samples = particles[idx.to(particles.device)]
@@ -423,8 +449,8 @@ def run_smc(config, args, run_class_name, target_class_list, classifier,
 
         metrics = evaluate_images(eval_samples, real_loader, target_class_list, classifier, inception_model, config)
         metrics.update({'NFEs': nfe_target, 'ActualNFEs': out.nfes, 'ActualParticles': n_particles,
-                        'FinalWeightESS': float(1.0 / (w.pow(2).sum() * n_particles)),
-                        'InvalidParticles': int((~torch.isfinite(out.log_weights)).sum()) if use_smc
+                        'FinalWeightESS': float('nan') if upstream else float(1.0 / (w.pow(2).sum() * n_particles)),
+                        'InvalidParticles': int((~torch.isfinite(out.log_weights)).sum()) if use_smc and not upstream
                                             else int((~torch.isfinite(particles).flatten(1).all(dim=1)).sum()),
                         'Time': run_time, 'RewardEvals': run_reward_evals, 'PeakMemMB': peak_mem})
         finish_nfe_point(eval_samples, metrics, method_name, run_class_name, nfe_target, output_dir_method, config, args)
